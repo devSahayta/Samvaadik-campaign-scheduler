@@ -2,7 +2,7 @@
 // WhatsApp Campaign Scheduler - Optimized for Render.com
 // Handles unlimited contacts with pagination, batch processing, and timeout protection
 
-import cron from 'node-cron';
+// import cron from 'node-cron';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 
@@ -24,33 +24,33 @@ let isProcessing = false;
    MAIN SCHEDULER FUNCTION
 ====================================== */
 
-export function startCampaignScheduler() {
-  console.log('🚀 Campaign Scheduler Started!');
-  console.log('⏰ Cron will run every minute...');
+// export function startCampaignScheduler() {
+//   console.log('🚀 Campaign Scheduler Started!');
+//   console.log('⏰ Cron will run every minute...');
 
-  // Run every minute: */1 * * * *
-  cron.schedule('* * * * *', async () => {
-    if (isProcessing) {
-      console.log('⏭️  Skipping: Previous execution still running');
-      return;
-    }
+//   // Run every minute: */1 * * * *
+//   // cron.schedule('* * * * *', async () => {
+//   //   if (isProcessing) {
+//   //     console.log('⏭️  Skipping: Previous execution still running');
+//   //     return;
+//   //   }
 
-    try {
-      isProcessing = true;
-      await checkAndSendCampaigns();
-    } catch (err) {
-      console.error('❌ Scheduler error:', err);
-    } finally {
-      isProcessing = false;
-    }
-  });
-}
+//   //   try {
+//   //     isProcessing = true;
+//   //     await checkAndSendCampaigns();
+//   //   } catch (err) {
+//   //     console.error('❌ Scheduler error:', err);
+//   //   } finally {
+//   //     isProcessing = false;
+//   //   }
+//   // });
+// }
 
 /* =====================================
    CHECK FOR SCHEDULED CAMPAIGNS
 ====================================== */
 
-async function checkAndSendCampaigns() {
+export async function checkAndSendCampaigns() {
   const now = new Date();
   console.log(`\n🔍 [${now.toISOString()}] Checking for campaigns...`);
 
@@ -596,4 +596,4 @@ function sleep(ms) {
    EXPORT
 ====================================== */
 
-export default { startCampaignScheduler };
+export default { };
