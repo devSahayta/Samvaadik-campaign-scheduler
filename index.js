@@ -1,93 +1,43 @@
 // scheduler/index.js
-// Entry point for WhatsApp Campaign Scheduler on Render.com
 
-import dotenv from 'dotenv';
-import { startCampaignScheduler } from './campaignScheduler.js';
+import express from "express";
+import dotenv from "dotenv";
+import { checkAndSendCampaigns } from "./campaignScheduler.js";
 
-// Load environment variables
-dotenv.config({ path: '.env' });
+dotenv.config();
 
-console.log('════════════════════════════════════════════════════════');
-console.log('🚀 WhatsApp Campaign Scheduler - Starting...');
-console.log('════════════════════════════════════════════════════════');
-console.log('📅 Date:', new Date().toISOString());
-console.log('🌍 Environment:', process.env.NODE_ENV || 'development');
-console.log('📍 Platform: Render.com Background Worker');
-console.log('════════════════════════════════════════════════════════');
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Verify required environment variables
-const requiredEnvVars = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
-const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+console.log("🚀 WhatsApp Campaign Scheduler API Starting...");
 
-if (missingVars.length > 0) {
-  console.error('❌ Missing required environment variables:', missingVars.join(', '));
-  console.error('💡 Please add them in Render dashboard → Environment');
-  process.exit(1);
-}
+// Security token so random people cannot trigger it
+const CRON_SECRET = process.env.CRON_SECRET || "mysecret";
 
-console.log('✅ Environment variables loaded');
-console.log('📊 Supabase URL:', process.env.SUPABASE_URL?.substring(0, 30) + '...');
-console.log('🔑 Supabase Key:', process.env.SUPABASE_ANON_KEY?.substring(0, 20) + '...');
+// Endpoint called by cron-job.org
+app.get("/run-scheduler", async (req, res) => {
 
-// Start the campaign scheduler
-console.log('\n⏰ Starting cron job (runs every minute)...');
-try {
-  startCampaignScheduler();
-  console.log('✅ Scheduler is running successfully!');
-  console.log('🔄 Checking for campaigns every 60 seconds');
-  console.log('💡 Press Ctrl+C to stop (or let Render manage it)');
-  console.log('════════════════════════════════════════════════════════\n');
-} catch (err) {
-  console.error('❌ Failed to start scheduler:', err);
-  process.exit(1);
-}
+  if (req.query.secret !== CRON_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
 
-/* =====================================
-   GRACEFUL SHUTDOWN HANDLERS
-====================================== */
+  console.log("🔔 Scheduler triggered:", new Date().toISOString());
 
-process.on('SIGTERM', () => {
-  console.log('\n════════════════════════════════════════════════════════');
-  console.log('👋 Received SIGTERM signal');
-  console.log('🛑 Shutting down gracefully...');
-  console.log('════════════════════════════════════════════════════════');
-  process.exit(0);
+  try {
+    await checkAndSendCampaigns();
+    res.send("Scheduler executed successfully");
+  } catch (err) {
+    console.error("Scheduler failed:", err);
+    res.status(500).send("Scheduler error");
+  }
+
 });
 
-process.on('SIGINT', () => {
-  console.log('\n════════════════════════════════════════════════════════');
-  console.log('👋 Received SIGINT signal (Ctrl+C)');
-  console.log('🛑 Shutting down gracefully...');
-  console.log('════════════════════════════════════════════════════════');
-  process.exit(0);
+// Health check
+app.get("/", (req, res) => {
+  res.send("Scheduler service running");
 });
 
-/* =====================================
-   ERROR HANDLERS
-====================================== */
-
-process.on('uncaughtException', (error) => {
-  console.error('\n════════════════════════════════════════════════════════');
-  console.error('💥 Uncaught Exception:', error);
-  console.error('Stack:', error.stack);
-  console.error('════════════════════════════════════════════════════════');
-  process.exit(1);
+app.listen(PORT, () => {
+  console.log(`🌐 Server running on port ${PORT}`);
 });
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('\n════════════════════════════════════════════════════════');
-  console.error('💥 Unhandled Rejection at:', promise);
-  console.error('Reason:', reason);
-  console.error('════════════════════════════════════════════════════════');
-  process.exit(1);
-});
-
-/* =====================================
-   KEEP-ALIVE (Optional)
-====================================== */
-
-// Send heartbeat every 5 minutes to show service is alive
-setInterval(() => {
-  const now = new Date();
-  console.log(`💓 Heartbeat: ${now.toISOString()} - Scheduler running smoothly`);
-}, 5 * 60 * 1000); // Every 5 minutes
