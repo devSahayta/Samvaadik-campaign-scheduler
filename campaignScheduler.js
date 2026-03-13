@@ -97,6 +97,15 @@ async function processCampaign(campaign) {
   console.log(`\n📤 Processing: ${campaign.campaign_name}`);
   console.log(`   Campaign ID: ${campaign.campaign_id}`);
   console.log(`   Scheduled: ${campaign.scheduled_at}`);
+
+  console.log(`
+══════════════════════════════
+📢 CAMPAIGN STARTED
+Name: ${campaign.campaign_name}
+Contacts: ${totalPending}
+Time: ${new Date().toISOString()}
+══════════════════════════════
+`);
   if (campaign.media_id) {
     console.log(`   📎 Media ID: ${campaign.media_id}`);
   }
@@ -306,10 +315,15 @@ async function processCampaign(campaign) {
     // 7️⃣ Complete campaign
     await markCampaignCompleted(campaign.campaign_id, sent, failed);
 
-    console.log(`\n✅ Campaign completed!`);
-    console.log(`   Total: ${sent + failed}`);
-    console.log(`   Sent: ${sent}`);
-    console.log(`   Failed: ${failed}`);
+   console.log(`
+✅ CAMPAIGN COMPLETED
+Name: ${campaign.campaign_name}
+Time: ${new Date().toISOString()}
+══════════════════════════════
+Sent: ${sent}
+Failed: ${failed}
+Duration: ${(Date.now() - startTime)/1000}s
+`);
   } catch (err) {
     console.error(`❌ Campaign processing failed:`, err);
 
