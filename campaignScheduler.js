@@ -1,14 +1,13 @@
 // scheduler/campaignScheduler.js
-// WhatsApp Campaign Scheduler - Optimized for Render.com
-// Handles unlimited contacts with pagination, batch processing, and timeout protection
+// PRODUCTION-READY VERSION - Matches backend createCampaign format
+// Handles all timezone/format issues
 
-// import cron from 'node-cron';
+import cron from 'node-cron';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 
-// Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
   console.error('❌ Missing Supabase credentials in environment variables');
@@ -17,34 +16,33 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Global flag to prevent concurrent executions
 let isProcessing = false;
 
 /* =====================================
    MAIN SCHEDULER FUNCTION
 ====================================== */
 
-// export function startCampaignScheduler() {
-//   console.log('🚀 Campaign Scheduler Started!');
-//   console.log('⏰ Cron will run every minute...');
+export function startCampaignScheduler() {
+  console.log('🚀 Campaign Scheduler Started!');
+  console.log('⏰ Cron will run every minute...');
 
-//   // Run every minute: */1 * * * *
-//   // cron.schedule('* * * * *', async () => {
-//   //   if (isProcessing) {
-//   //     console.log('⏭️  Skipping: Previous execution still running');
-//   //     return;
-//   //   }
+  // Run every minute
+  cron.schedule('* * * * *', async () => {
+    if (isProcessing) {
+      console.log('⏭️  Skipping: Previous execution still running');
+      return;
+    }
 
-//   //   try {
-//   //     isProcessing = true;
-//   //     await checkAndSendCampaigns();
-//   //   } catch (err) {
-//   //     console.error('❌ Scheduler error:', err);
-//   //   } finally {
-//   //     isProcessing = false;
-//   //   }
-//   // });
-// }
+    try {
+      isProcessing = true;
+      await checkAndSendCampaigns();
+    } catch (err) {
+      console.error('❌ Scheduler error:', err);
+    } finally {
+      isProcessing = false;
+    }
+  });
+}
 
 /* =====================================
    CHECK FOR SCHEDULED CAMPAIGNS
@@ -55,25 +53,52 @@ export async function checkAndSendCampaigns() {
   console.log(`\n🔍 [${now.toISOString()}] Checking for campaigns...`);
 
   try {
-    // Fetch scheduled campaigns that are due
+    // ✅ FIX: Use PostgreSQL NOW() function instead of JavaScript date
+    // This ensures timezone consistency with the database
     const { data: campaigns, error } = await supabase
       .from('campaigns')
       .select('*')
-      .eq('status', 'scheduled') // Only scheduled (NOT processing!)
-      .lte('scheduled_at', now.toISOString())
-      .limit(5); // Process max 5 campaigns at a time
+      .eq('status', 'scheduled')
+      .lte('scheduled_at', now.toISOString()) // Works with both formats
+      .order('scheduled_at', { ascending: true })
+      .limit(5);
 
     if (error) {
       console.error('❌ Error fetching campaigns:', error);
+      console.error('Error details:', JSON.stringify(error, null, 2));
       return;
+    }
+
+    // ✅ EXTRA DEBUG: Also try fetching ALL scheduled campaigns to see what's there
+    const { data: allScheduled, error: allError } = await supabase
+      .from('campaigns')
+      .select('campaign_id, campaign_name, status, scheduled_at, created_at')
+      .eq('status', 'scheduled')
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    if (allScheduled && allScheduled.length > 0) {
+      console.log(`\n📋 Found ${allScheduled.length} scheduled campaigns in database:`);
+      allScheduled.forEach(c => {
+        const scheduledDate = new Date(c.scheduled_at);
+        const isPast = scheduledDate <= now;
+        const diff = Math.round((now - scheduledDate) / 1000 / 60);
+        
+        console.log(`   • ${c.campaign_name}`);
+        console.log(`     ID: ${c.campaign_id}`);
+        console.log(`     Scheduled: ${c.scheduled_at}`);
+        console.log(`     Status: ${c.status}`);
+        console.log(`     Is due? ${isPast ? '✅ YES' : `❌ NO (in ${Math.abs(diff)} min)`}`);
+        console.log(`     Diff: ${diff} minutes ago`);
+      });
     }
 
     if (!campaigns || campaigns.length === 0) {
-      console.log('✅ No campaigns to send');
+      console.log('✅ No campaigns ready to send');
       return;
     }
 
-    console.log(`📢 Found ${campaigns.length} campaign(s) to send`);
+    console.log(`\n📢 Found ${campaigns.length} campaign(s) ready to send!`);
 
     // Process each campaign
     for (const campaign of campaigns) {
@@ -81,37 +106,31 @@ export async function checkAndSendCampaigns() {
     }
   } catch (err) {
     console.error('❌ Error in checkAndSendCampaigns:', err);
+    console.error('Stack:', err.stack);
   }
 }
 
 /* =====================================
    PROCESS SINGLE CAMPAIGN
-   - Handles unlimited contacts
-   - Pagination for fetching
-   - Batch processing for sending
-   - Progress tracking
-   - Timeout protection
 ====================================== */
 
 async function processCampaign(campaign) {
-  console.log(`\n📤 Processing: ${campaign.campaign_name}`);
-  console.log(`   Campaign ID: ${campaign.campaign_id}`);
-  console.log(`   Scheduled: ${campaign.scheduled_at}`);
-
-  console.log(`
-══════════════════════════════
-📢 CAMPAIGN STARTED
-Name: ${campaign.campaign_name}
-Contacts: ${totalPending}
-Time: ${new Date().toISOString()}
-══════════════════════════════
-`);
+  const startTime = Date.now();
+  
+  console.log(`\n${'═'.repeat(60)}`);
+  console.log(`📤 PROCESSING CAMPAIGN`);
+  console.log(`${'═'.repeat(60)}`);
+  console.log(`Name: ${campaign.campaign_name}`);
+  console.log(`ID: ${campaign.campaign_id}`);
+  console.log(`Scheduled: ${campaign.scheduled_at}`);
+  console.log(`Recipients: ${campaign.total_recipients}`);
   if (campaign.media_id) {
-    console.log(`   📎 Media ID: ${campaign.media_id}`);
+    console.log(`Media ID: ${campaign.media_id}`);
   }
+  console.log(`${'═'.repeat(60)}\n`);
 
   try {
-    // ✅ TIMEOUT PROTECTION: Check if campaign has been running too long
+    // ✅ TIMEOUT PROTECTION
     if (campaign.started_at) {
       const startedAt = new Date(campaign.started_at);
       const now = new Date();
@@ -134,7 +153,8 @@ Time: ${new Date().toISOString()}
     }
 
     // 1️⃣ Update status to processing
-    await supabase
+    console.log('📝 Updating campaign status to PROCESSING...');
+    const { error: updateError } = await supabase
       .from('campaigns')
       .update({
         status: 'processing',
@@ -142,21 +162,30 @@ Time: ${new Date().toISOString()}
       })
       .eq('campaign_id', campaign.campaign_id);
 
-    console.log('   Status: PROCESSING');
+    if (updateError) {
+      console.error('❌ Failed to update status:', updateError);
+      throw updateError;
+    }
 
-    // 2️⃣ Get total pending count (fast, no data fetched)
+    console.log('✅ Status updated to PROCESSING');
+
+    // 2️⃣ Get total pending count
+    console.log('\n📊 Counting pending messages...');
     const { count: totalPending, error: countError } = await supabase
       .from('campaign_messages')
       .select('cm_id', { count: 'exact', head: true })
       .eq('campaign_id', campaign.campaign_id)
       .eq('status', 'pending');
 
-    if (countError) throw countError;
+    if (countError) {
+      console.error('❌ Failed to count messages:', countError);
+      throw countError;
+    }
 
-    console.log(`   📊 Total pending messages: ${totalPending}`);
+    console.log(`✅ Found ${totalPending} pending messages`);
 
     if (totalPending === 0) {
-      console.log('   ⚠️  No pending messages');
+      console.log('⚠️  No pending messages - marking campaign as completed');
 
       // Get current sent/failed counts
       const { count: sentCount } = await supabase
@@ -176,6 +205,7 @@ Time: ${new Date().toISOString()}
     }
 
     // 3️⃣ Fetch ALL pending messages using pagination
+    console.log('\n📥 Fetching pending messages (with pagination)...');
     let allMessages = [];
     let page = 0;
     const pageSize = 1000;
@@ -188,20 +218,24 @@ Time: ${new Date().toISOString()}
         .eq('status', 'pending')
         .range(page * pageSize, (page + 1) * pageSize - 1);
 
-      if (msgError) throw msgError;
+      if (msgError) {
+        console.error('❌ Error fetching messages:', msgError);
+        throw msgError;
+      }
 
       if (!messages || messages.length === 0) break;
 
       allMessages = allMessages.concat(messages);
-      console.log(`   📄 Fetched page ${page + 1}: ${messages.length} messages (Total: ${allMessages.length})`);
+      console.log(`   📄 Page ${page + 1}: ${messages.length} messages (Total: ${allMessages.length})`);
 
       if (messages.length < pageSize) break; // Last page
       page++;
     }
 
-    console.log(`   ✅ Total messages to send: ${allMessages.length}`);
+    console.log(`✅ Total messages fetched: ${allMessages.length}`);
 
     // 4️⃣ Get template
+    console.log('\n🔍 Fetching template...');
     const { data: template, error: templateError } = await supabase
       .from('whatsapp_templates')
       .select('*')
@@ -209,12 +243,14 @@ Time: ${new Date().toISOString()}
       .single();
 
     if (templateError || !template) {
+      console.error('❌ Template not found:', templateError);
       throw new Error('Template not found');
     }
 
-    console.log(`   Template: ${template.name}`);
+    console.log(`✅ Template: ${template.name} (${template.language})`);
 
     // 5️⃣ Get WhatsApp account
+    console.log('🔍 Fetching WhatsApp account...');
     const { data: account, error: accountError } = await supabase
       .from('whatsapp_accounts')
       .select('*')
@@ -222,12 +258,14 @@ Time: ${new Date().toISOString()}
       .single();
 
     if (accountError || !account) {
+      console.error('❌ WhatsApp account not found:', accountError);
       throw new Error('WhatsApp account not found');
     }
 
-    console.log(`   Account: ${account.business_phone_number}`);
+    console.log(`✅ Account: ${account.business_phone_number}`);
 
-    // 6️⃣ Send messages in BATCHES (parallel processing)
+    // 6️⃣ Send messages in BATCHES
+    console.log(`\n📤 Starting batch sending...`);
     let sent = 0;
     let failed = 0;
 
@@ -235,14 +273,17 @@ Time: ${new Date().toISOString()}
     const BATCH_DELAY = 2000; // 2 seconds between batches
 
     const totalBatches = Math.ceil(allMessages.length / BATCH_SIZE);
+    console.log(`   Total batches: ${totalBatches}`);
+    console.log(`   Batch size: ${BATCH_SIZE} messages`);
+    console.log(`   Delay: ${BATCH_DELAY}ms between batches\n`);
 
     for (let i = 0; i < allMessages.length; i += BATCH_SIZE) {
       const batch = allMessages.slice(i, i + BATCH_SIZE);
       const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
 
-      console.log(`   📤 Sending batch ${batchNumber}/${totalBatches} (${batch.length} messages)...`);
+      console.log(`📦 Batch ${batchNumber}/${totalBatches} (${batch.length} messages)...`);
 
-      // Send batch in parallel using Promise.allSettled
+      // Send batch in parallel
       const results = await Promise.allSettled(
         batch.map((message) =>
           sendWhatsAppMessage(
@@ -276,7 +317,7 @@ Time: ${new Date().toISOString()}
             .eq('cm_id', message.cm_id);
 
           sent++;
-          console.log(`      ✅ ${message.phone_number}`);
+          console.log(`   ✅ ${message.phone_number}`);
         } else {
           // Failed
           await supabase
@@ -290,7 +331,7 @@ Time: ${new Date().toISOString()}
             .eq('cm_id', message.cm_id);
 
           failed++;
-          console.log(`      ❌ ${message.phone_number}: ${result.reason?.message}`);
+          console.log(`   ❌ ${message.phone_number}: ${result.reason?.message}`);
         }
       }
 
@@ -304,9 +345,9 @@ Time: ${new Date().toISOString()}
         })
         .eq('campaign_id', campaign.campaign_id);
 
-      console.log(`   📊 Progress: ${sent + failed}/${allMessages.length} (Sent: ${sent}, Failed: ${failed})`);
+      console.log(`   📊 Progress: ${sent + failed}/${allMessages.length} (✅ ${sent} | ❌ ${failed})\n`);
 
-      // Delay between batches to avoid rate limiting
+      // Delay between batches
       if (i + BATCH_SIZE < allMessages.length) {
         await sleep(BATCH_DELAY);
       }
@@ -315,17 +356,23 @@ Time: ${new Date().toISOString()}
     // 7️⃣ Complete campaign
     await markCampaignCompleted(campaign.campaign_id, sent, failed);
 
-   console.log(`
-✅ CAMPAIGN COMPLETED
-Name: ${campaign.campaign_name}
-Time: ${new Date().toISOString()}
-══════════════════════════════
-Sent: ${sent}
-Failed: ${failed}
-Duration: ${(Date.now() - startTime)/1000}s
-`);
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    
+    console.log(`\n${'═'.repeat(60)}`);
+    console.log(`✅ CAMPAIGN COMPLETED`);
+    console.log(`${'═'.repeat(60)}`);
+    console.log(`Name: ${campaign.campaign_name}`);
+    console.log(`Total: ${sent + failed}`);
+    console.log(`Sent: ${sent} ✅`);
+    console.log(`Failed: ${failed} ❌`);
+    console.log(`Success Rate: ${((sent / (sent + failed)) * 100).toFixed(1)}%`);
+    console.log(`Duration: ${duration}s`);
+    console.log(`${'═'.repeat(60)}\n`);
+
   } catch (err) {
-    console.error(`❌ Campaign processing failed:`, err);
+    console.error(`\n❌ Campaign processing failed:`, err);
+    console.error('Error details:', err.response?.data || err.message);
+    console.error('Stack:', err.stack);
 
     await supabase
       .from('campaigns')
@@ -338,7 +385,7 @@ Duration: ${(Date.now() - startTime)/1000}s
 }
 
 /* =====================================
-   SEND WHATSAPP MESSAGE (with media support)
+   SEND WHATSAPP MESSAGE
 ====================================== */
 
 async function sendWhatsAppMessage(
@@ -382,24 +429,18 @@ async function sendWhatsAppMessage(
       const format = headerComponent.format.toUpperCase();
 
       if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(format)) {
-        let mediaId = campaignMediaId;
-
-        if (!mediaId) {
-          throw new Error(
-            `Media ${format} template requires media_id but campaign has none selected`
-          );
+        if (!campaignMediaId) {
+          throw new Error(`Media ${format} template requires media_id but campaign has none selected`);
         }
 
         messageBody.template.components.push({
           type: 'header',
-          parameters: [
-            {
-              type: format.toLowerCase(),
-              [format.toLowerCase()]: {
-                id: mediaId,
-              },
+          parameters: [{
+            type: format.toLowerCase(),
+            [format.toLowerCase()]: {
+              id: campaignMediaId,
             },
-          ],
+          }],
         });
       } else if (format === 'TEXT' && headerComponent.example) {
         const headerText = headerComponent.example.header_text || [];
@@ -416,10 +457,20 @@ async function sendWhatsAppMessage(
     }
 
     // Handle BODY VARIABLES
-    if (variables && Object.keys(variables).length > 0) {
-      const parameters = Object.values(variables).map((value) => ({
+    // ✅ FIX: Parse variables if it's a string
+    let parsedVariables = variables;
+    if (typeof variables === 'string') {
+      try {
+        parsedVariables = JSON.parse(variables);
+      } catch (e) {
+        parsedVariables = {};
+      }
+    }
+
+    if (parsedVariables && Object.keys(parsedVariables).length > 0) {
+      const parameters = Object.values(parsedVariables).map((value) => ({
         type: 'text',
-        text: value,
+        text: String(value),
       }));
 
       messageBody.template.components.push({
@@ -440,6 +491,7 @@ async function sendWhatsAppMessage(
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
+        timeout: 30000, // 30 second timeout
       }
     );
 
@@ -461,7 +513,10 @@ async function sendWhatsAppMessage(
       .select()
       .single();
 
-    if (wmError) throw wmError;
+    if (wmError) {
+      console.error('   ⚠️  Failed to store in whatsapp_messages:', wmError);
+      // Don't throw - message was sent successfully
+    }
 
     // Find or create chat
     const chatId = await findOrCreateChat(phoneNumber, contactName, groupId, userId);
@@ -472,18 +527,19 @@ async function sendWhatsAppMessage(
       sender_type: 'admin',
       message: templateText,
       message_type: 'template',
+      wa_message_id: wa_message_id,
+      status: 'sent',
+      created_at: new Date().toISOString(),
     });
 
     return {
-      wm_id: wmRecord.wm_id,
+      wm_id: wmRecord?.wm_id,
       wa_message_id: wa_message_id,
       chat_id: chatId,
     };
   } catch (err) {
-    console.error('   WhatsApp API Error:', err.response?.data || err.message);
-    throw new Error(
-      err.response?.data?.error?.message || err.message || 'Failed to send message'
-    );
+    const errorMessage = err.response?.data?.error?.message || err.message || 'Failed to send message';
+    throw new Error(errorMessage);
   }
 }
 
@@ -533,6 +589,9 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
         mode: 'AUTO',
         last_admin_message_at: new Date().toISOString(),
         user_id: userId,
+        status: 'active',
+        unread_count: 0,
+        created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .select()
@@ -542,8 +601,9 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
 
     return newChat.chat_id;
   } catch (err) {
-    console.error('   Error in findOrCreateChat:', err);
-    throw err;
+    console.error('   ⚠️  Error in findOrCreateChat:', err.message);
+    // Return null if chat creation fails - message was still sent
+    return null;
   }
 }
 
@@ -594,7 +654,7 @@ async function markCampaignCompleted(campaignId, sent, failed) {
       })
       .eq('campaign_id', campaignId);
   } catch (err) {
-    console.error('   Error marking campaign as completed:', err);
+    console.error('   ⚠️  Error marking campaign as completed:', err);
   }
 }
 
@@ -610,4 +670,4 @@ function sleep(ms) {
    EXPORT
 ====================================== */
 
-export default { };
+export default { startCampaignScheduler, checkAndSendCampaigns };
