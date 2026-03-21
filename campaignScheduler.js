@@ -379,14 +379,20 @@ async function processCampaign(campaign) {
       }
     }
 
-    // ✅ UPDATE WARM-UP PROGRESS
-    if (account.warmup_enabled && !account.warmup_completed && sent > 0) {
-      console.log(`\n🔥 Updating warm-up progress...`);
-      await updateWarmupProgress(account.wa_id, sent, account);
-    }
+   // ✅ UPDATE WARM-UP PROGRESS (during warm-up)
+if (account.warmup_enabled && !account.warmup_completed && sent > 0) {
+  console.log(`\n🔥 Updating warm-up progress...`);
+  await updateWarmupProgress(account.wa_id, sent, account);
+}
 
-    // 7️⃣ Complete or pause campaign
-    const remainingPending = totalPending - allMessages.length;
+// ✅ NEW: UPDATE TIER DAILY SENT (after warm-up completes)
+if (account.warmup_completed && sent > 0) {
+  console.log(`\n📊 Updating tier daily sent...`);
+  await updateTierDailySent(account.wa_id, sent, account);
+}
+
+// 7️⃣ Complete or pause campaign
+const remainingPending = totalPending - allMessages.length;
 
     if (remainingPending > 0) {
       // Campaign has more messages, keep as scheduled
@@ -526,6 +532,56 @@ async function updateWarmupProgress(account_id, messages_sent, account) {
     }
   } catch (error) {
     console.error('   ⚠️  Error updating warm-up progress:', error);
+  }
+}
+
+/* =====================================
+   UPDATE TIER DAILY SENT
+====================================== */
+async function updateTierDailySent(account_id, messages_sent, account) {
+  try {
+    console.log(`📊 Updating tier daily sent for account ${account_id}`);
+    
+    const now = new Date();
+    const tierDailySent = account.tier_daily_sent || 0;
+    
+    // Check if we need to reset (new day)
+    const lastResetDate = account.tier_daily_reset_at 
+      ? new Date(account.tier_daily_reset_at).toISOString().split('T')[0]
+      : null;
+    const todayDate = now.toISOString().split('T')[0];
+    
+    let newTierDailySent;
+    
+    if (!lastResetDate || lastResetDate !== todayDate) {
+      // New day - reset counter
+      console.log('🔄 New day detected - resetting tier daily counter');
+      newTierDailySent = messages_sent;
+    } else {
+      // Same day - increment
+      newTierDailySent = tierDailySent + messages_sent;
+    }
+    
+    // Update database
+    const { data: updateData, error: updateError } = await supabase
+      .from('whatsapp_accounts')
+      .update({
+        tier_daily_sent: newTierDailySent,
+        tier_daily_reset_at: now.toISOString()
+      })
+      .eq('wa_id', account_id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('❌ Error updating tier daily sent:', updateError);
+      return;
+    }
+
+    console.log(`✅ Tier daily sent updated: ${newTierDailySent}/${account.messaging_limit_per_day}`);
+    
+  } catch (err) {
+    console.error('❌ Error in updateTierDailySent:', err);
   }
 }
 
