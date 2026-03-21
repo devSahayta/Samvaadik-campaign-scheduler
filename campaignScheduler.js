@@ -1,6 +1,6 @@
 // scheduler/campaignScheduler.js
-// PRODUCTION-READY VERSION - Matches backend createCampaign format
-// Handles all timezone/format issues
+// UPDATED WITH WARM-UP TRACKING + INDUSTRY-STANDARD RATES
+// Keeps all existing functionality, adds warm-up progress tracking
 
 import cron from 'node-cron';
 import { createClient } from '@supabase/supabase-js';
@@ -18,6 +18,12 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 let isProcessing = false;
 
+// ✅ INDUSTRY-STANDARD SENDING RATES
+// WhatsApp best practices: 20-40 messages/minute to avoid rate limits
+const BATCH_SIZE = 5;        // Send 5 messages in parallel (reduced from 10)
+const BATCH_DELAY = 6000;    // 6 seconds between batches (increased from 2s)
+                              // = ~50 messages/minute (industry standard)
+
 /* =====================================
    MAIN SCHEDULER FUNCTION
 ====================================== */
@@ -25,6 +31,7 @@ let isProcessing = false;
 export function startCampaignScheduler() {
   console.log('🚀 Campaign Scheduler Started!');
   console.log('⏰ Cron will run every minute...');
+  console.log(`📊 Sending rate: ${BATCH_SIZE} messages every ${BATCH_DELAY/1000}s (~${Math.round((BATCH_SIZE * 60) / (BATCH_DELAY/1000))} msg/min)`);
 
   // Run every minute
   cron.schedule('* * * * *', async () => {
@@ -53,44 +60,17 @@ export async function checkAndSendCampaigns() {
   console.log(`\n🔍 [${now.toISOString()}] Checking for campaigns...`);
 
   try {
-    // ✅ FIX: Use PostgreSQL NOW() function instead of JavaScript date
-    // This ensures timezone consistency with the database
     const { data: campaigns, error } = await supabase
       .from('campaigns')
       .select('*')
       .eq('status', 'scheduled')
-      .lte('scheduled_at', now.toISOString()) // Works with both formats
+      .lte('scheduled_at', now.toISOString())
       .order('scheduled_at', { ascending: true })
       .limit(5);
 
     if (error) {
       console.error('❌ Error fetching campaigns:', error);
-      console.error('Error details:', JSON.stringify(error, null, 2));
       return;
-    }
-
-    // ✅ EXTRA DEBUG: Also try fetching ALL scheduled campaigns to see what's there
-    const { data: allScheduled, error: allError } = await supabase
-      .from('campaigns')
-      .select('campaign_id, campaign_name, status, scheduled_at, created_at')
-      .eq('status', 'scheduled')
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    if (allScheduled && allScheduled.length > 0) {
-      console.log(`\n📋 Found ${allScheduled.length} scheduled campaigns in database:`);
-      allScheduled.forEach(c => {
-        const scheduledDate = new Date(c.scheduled_at);
-        const isPast = scheduledDate <= now;
-        const diff = Math.round((now - scheduledDate) / 1000 / 60);
-        
-        console.log(`   • ${c.campaign_name}`);
-        console.log(`     ID: ${c.campaign_id}`);
-        console.log(`     Scheduled: ${c.scheduled_at}`);
-        console.log(`     Status: ${c.status}`);
-        console.log(`     Is due? ${isPast ? '✅ YES' : `❌ NO (in ${Math.abs(diff)} min)`}`);
-        console.log(`     Diff: ${diff} minutes ago`);
-      });
     }
 
     if (!campaigns || campaigns.length === 0) {
@@ -106,7 +86,6 @@ export async function checkAndSendCampaigns() {
     }
   } catch (err) {
     console.error('❌ Error in checkAndSendCampaigns:', err);
-    console.error('Stack:', err.stack);
   }
 }
 
@@ -124,6 +103,9 @@ async function processCampaign(campaign) {
   console.log(`ID: ${campaign.campaign_id}`);
   console.log(`Scheduled: ${campaign.scheduled_at}`);
   console.log(`Recipients: ${campaign.total_recipients}`);
+  if (campaign.warmup_stage) {
+    console.log(`🔥 Warm-up Stage: ${campaign.warmup_stage}`);
+  }
   if (campaign.media_id) {
     console.log(`Media ID: ${campaign.media_id}`);
   }
@@ -169,7 +151,42 @@ async function processCampaign(campaign) {
 
     console.log('✅ Status updated to PROCESSING');
 
-    // 2️⃣ Get total pending count
+    // 2️⃣ Get WhatsApp account (needed for warm-up check)
+    console.log('🔍 Fetching WhatsApp account...');
+    const { data: account, error: accountError } = await supabase
+      .from('whatsapp_accounts')
+      .select('*')
+      .eq('wa_id', campaign.account_id)
+      .single();
+
+    if (accountError || !account) {
+      console.error('❌ WhatsApp account not found:', accountError);
+      throw new Error('WhatsApp account not found');
+    }
+
+    console.log(`✅ Account: ${account.business_phone_number}`);
+    console.log(`   Tier: ${account.messaging_limit_tier}`);
+    
+    // ✅ CHECK WARM-UP STATUS
+    if (account.warmup_enabled && !account.warmup_completed) {
+      const warmup_limits = account.warmup_limits || [200, 500, 1000];
+      const current_stage = account.warmup_stage || 1;
+      const current_limit = warmup_limits[current_stage - 1];
+      const current_progress = account.warmup_stage_progress || 0;
+      const remaining_in_stage = current_limit - current_progress;
+
+      console.log(`🔥 WARM-UP ACTIVE:`);
+      console.log(`   Stage: ${current_stage}/${warmup_limits.length}`);
+      console.log(`   Limit: ${current_limit} messages/stage`);
+      console.log(`   Progress: ${current_progress}/${current_limit}`);
+      console.log(`   Remaining: ${remaining_in_stage}`);
+    } else if (account.warmup_completed) {
+      console.log(`✅ Warm-up completed - sending at full capacity`);
+    } else {
+      console.log(`⏭️  No warm-up required for this tier`);
+    }
+
+    // 3️⃣ Get total pending count
     console.log('\n📊 Counting pending messages...');
     const { count: totalPending, error: countError } = await supabase
       .from('campaign_messages')
@@ -187,7 +204,6 @@ async function processCampaign(campaign) {
     if (totalPending === 0) {
       console.log('⚠️  No pending messages - marking campaign as completed');
 
-      // Get current sent/failed counts
       const { count: sentCount } = await supabase
         .from('campaign_messages')
         .select('cm_id', { count: 'exact', head: true })
@@ -204,13 +220,32 @@ async function processCampaign(campaign) {
       return;
     }
 
-    // 3️⃣ Fetch ALL pending messages using pagination
-    console.log('\n📥 Fetching pending messages (with pagination)...');
+    // ✅ WARM-UP LIMIT CHECK
+    // Determine how many messages to send in this run
+    let messagesToSendCount = totalPending;
+    let warmupLimited = false;
+
+    if (account.warmup_enabled && !account.warmup_completed) {
+      const warmup_limits = account.warmup_limits || [200, 500, 1000];
+      const current_stage = account.warmup_stage || 1;
+      const current_limit = warmup_limits[current_stage - 1];
+      const current_progress = account.warmup_stage_progress || 0;
+      const remaining_in_stage = current_limit - current_progress;
+
+      if (totalPending > remaining_in_stage) {
+        console.log(`\n🔥 WARM-UP LIMIT: Can only send ${remaining_in_stage} of ${totalPending} messages`);
+        messagesToSendCount = remaining_in_stage;
+        warmupLimited = true;
+      }
+    }
+
+    // 4️⃣ Fetch messages to send (with warm-up limit)
+    console.log(`\n📥 Fetching ${messagesToSendCount} messages to send...`);
     let allMessages = [];
     let page = 0;
     const pageSize = 1000;
 
-    while (true) {
+    while (allMessages.length < messagesToSendCount) {
       const { data: messages, error: msgError } = await supabase
         .from('campaign_messages')
         .select('*')
@@ -228,13 +263,21 @@ async function processCampaign(campaign) {
       allMessages = allMessages.concat(messages);
       console.log(`   📄 Page ${page + 1}: ${messages.length} messages (Total: ${allMessages.length})`);
 
-      if (messages.length < pageSize) break; // Last page
+      if (allMessages.length >= messagesToSendCount) {
+        allMessages = allMessages.slice(0, messagesToSendCount);
+        break;
+      }
+
+      if (messages.length < pageSize) break;
       page++;
     }
 
-    console.log(`✅ Total messages fetched: ${allMessages.length}`);
+    console.log(`✅ Will send ${allMessages.length} messages this run`);
+    if (warmupLimited) {
+      console.log(`⏸️  Remaining ${totalPending - allMessages.length} messages will be sent after warm-up stage completes`);
+    }
 
-    // 4️⃣ Get template
+    // 5️⃣ Get template
     console.log('\n🔍 Fetching template...');
     const { data: template, error: templateError } = await supabase
       .from('whatsapp_templates')
@@ -249,33 +292,16 @@ async function processCampaign(campaign) {
 
     console.log(`✅ Template: ${template.name} (${template.language})`);
 
-    // 5️⃣ Get WhatsApp account
-    console.log('🔍 Fetching WhatsApp account...');
-    const { data: account, error: accountError } = await supabase
-      .from('whatsapp_accounts')
-      .select('*')
-      .eq('wa_id', campaign.account_id)
-      .single();
-
-    if (accountError || !account) {
-      console.error('❌ WhatsApp account not found:', accountError);
-      throw new Error('WhatsApp account not found');
-    }
-
-    console.log(`✅ Account: ${account.business_phone_number}`);
-
-    // 6️⃣ Send messages in BATCHES
+    // 6️⃣ Send messages in BATCHES (Industry-standard rate)
     console.log(`\n📤 Starting batch sending...`);
     let sent = 0;
     let failed = 0;
 
-    const BATCH_SIZE = 10; // Send 10 messages in parallel
-    const BATCH_DELAY = 2000; // 2 seconds between batches
-
     const totalBatches = Math.ceil(allMessages.length / BATCH_SIZE);
     console.log(`   Total batches: ${totalBatches}`);
     console.log(`   Batch size: ${BATCH_SIZE} messages`);
-    console.log(`   Delay: ${BATCH_DELAY}ms between batches\n`);
+    console.log(`   Delay: ${BATCH_DELAY}ms between batches`);
+    console.log(`   Rate: ~${Math.round((BATCH_SIZE * 60) / (BATCH_DELAY/1000))} messages/minute\n`);
 
     for (let i = 0; i < allMessages.length; i += BATCH_SIZE) {
       const batch = allMessages.slice(i, i + BATCH_SIZE);
@@ -339,32 +365,61 @@ async function processCampaign(campaign) {
       await supabase
         .from('campaigns')
         .update({
-          messages_sent: sent,
-          messages_failed: failed,
+          messages_sent: (campaign.messages_sent || 0) + sent,
+          messages_failed: (campaign.messages_failed || 0) + failed,
           updated_at: new Date().toISOString(),
         })
         .eq('campaign_id', campaign.campaign_id);
 
       console.log(`   📊 Progress: ${sent + failed}/${allMessages.length} (✅ ${sent} | ❌ ${failed})\n`);
 
-      // Delay between batches
+      // Delay between batches (industry-standard rate limiting)
       if (i + BATCH_SIZE < allMessages.length) {
         await sleep(BATCH_DELAY);
       }
     }
 
-    // 7️⃣ Complete campaign
-    await markCampaignCompleted(campaign.campaign_id, sent, failed);
+    // ✅ UPDATE WARM-UP PROGRESS
+    if (account.warmup_enabled && !account.warmup_completed && sent > 0) {
+      console.log(`\n🔥 Updating warm-up progress...`);
+      await updateWarmupProgress(account.wa_id, sent, account);
+    }
+
+    // 7️⃣ Complete or pause campaign
+    const remainingPending = totalPending - allMessages.length;
+
+    if (remainingPending > 0) {
+      // Campaign has more messages, keep as scheduled
+      console.log(`\n⏸️  Campaign paused: ${remainingPending} messages remaining`);
+      console.log(`   Will continue when warm-up stage progresses`);
+      
+      await supabase
+        .from('campaigns')
+        .update({
+          status: 'scheduled',  // Keep as scheduled
+          messages_sent: (campaign.messages_sent || 0) + sent,
+          messages_failed: (campaign.messages_failed || 0) + failed,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('campaign_id', campaign.campaign_id);
+    } else {
+      // All messages sent, complete campaign
+      await markCampaignCompleted(
+        campaign.campaign_id, 
+        (campaign.messages_sent || 0) + sent, 
+        (campaign.messages_failed || 0) + failed
+      );
+    }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     
     console.log(`\n${'═'.repeat(60)}`);
-    console.log(`✅ CAMPAIGN COMPLETED`);
+    console.log(`✅ CAMPAIGN ${remainingPending > 0 ? 'PAUSED' : 'COMPLETED'}`);
     console.log(`${'═'.repeat(60)}`);
     console.log(`Name: ${campaign.campaign_name}`);
-    console.log(`Total: ${sent + failed}`);
-    console.log(`Sent: ${sent} ✅`);
-    console.log(`Failed: ${failed} ❌`);
+    console.log(`Sent this run: ${sent} ✅`);
+    console.log(`Failed this run: ${failed} ❌`);
+    console.log(`Remaining: ${remainingPending}`);
     console.log(`Success Rate: ${((sent / (sent + failed)) * 100).toFixed(1)}%`);
     console.log(`Duration: ${duration}s`);
     console.log(`${'═'.repeat(60)}\n`);
@@ -372,7 +427,6 @@ async function processCampaign(campaign) {
   } catch (err) {
     console.error(`\n❌ Campaign processing failed:`, err);
     console.error('Error details:', err.response?.data || err.message);
-    console.error('Stack:', err.stack);
 
     await supabase
       .from('campaigns')
@@ -385,7 +439,98 @@ async function processCampaign(campaign) {
 }
 
 /* =====================================
-   SEND WHATSAPP MESSAGE
+   ✅ NEW: UPDATE WARM-UP PROGRESS
+====================================== */
+
+async function updateWarmupProgress(account_id, messages_sent, account) {
+  try {
+    // ✅ RESET DAILY COUNTER IF NEW DAY
+    function shouldResetDailyCounter(last_reset) {
+      if (!last_reset) return true;
+      const now = new Date();
+      const lastReset = new Date(last_reset);
+      const nowDay = now.toISOString().split('T')[0];
+      const lastResetDay = lastReset.toISOString().split('T')[0];
+      return nowDay !== lastResetDay;
+    }
+ 
+    let current_daily_sent = account.warmup_daily_sent || 0;
+    
+    // Auto-reset if new day
+    if (shouldResetDailyCounter(account.warmup_daily_reset_at)) {
+      console.log('   🔄 Resetting daily counter (new day)');
+      current_daily_sent = 0;
+    }
+ 
+    const new_daily_sent = current_daily_sent + messages_sent;
+ 
+    const warmup_limits = account.warmup_limits || [200, 500, 1000];
+    const current_stage = account.warmup_stage || 1;
+    const current_progress = (account.warmup_stage_progress || 0) + messages_sent;
+    const current_limit = warmup_limits[current_stage - 1];
+ 
+    console.log(`   Progress: ${current_progress}/${current_limit} (Stage ${current_stage})`);
+    console.log(`   Daily: ${new_daily_sent}/${current_limit}`);
+ 
+    // Check if stage completed
+    if (current_progress >= current_limit) {
+      if (current_stage < warmup_limits.length) {
+        // ✅ Move to next stage + UPDATE DAILY
+        await supabase
+          .from('whatsapp_accounts')
+          .update({
+            warmup_stage: current_stage + 1,
+            warmup_stage_progress: 0,
+            warmup_daily_sent: new_daily_sent,  // ✅ ADDED!
+            warmup_daily_reset_at: new Date().toISOString(),
+            warmup_last_updated_at: new Date().toISOString()
+          })
+          .eq('wa_id', account_id);
+ 
+        console.log(`   🎉 Stage ${current_stage} COMPLETED!`);
+        console.log(`   ✅ Advanced to Stage ${current_stage + 1} (limit: ${warmup_limits[current_stage]})`);
+        console.log(`   📊 Daily sent updated: ${new_daily_sent}`);
+      } else {
+        // ✅ Warm-up completed + UPDATE DAILY
+        await supabase
+          .from('whatsapp_accounts')
+          .update({
+            warmup_completed: true,
+            warmup_daily_sent: new_daily_sent,  // ✅ ADDED!
+            warmup_daily_reset_at: new Date().toISOString(),
+            warmup_last_updated_at: new Date().toISOString()
+          })
+          .eq('wa_id', account_id);
+ 
+        console.log(`   🏆 WARM-UP COMPLETED! Account can now send at full capacity!`);
+        console.log(`   📊 Daily sent updated: ${new_daily_sent}`);
+        console.log(`   ⚠️  Tier limit (${account.messaging_limit_per_day}/day) will still apply`);
+      }
+    } else {
+      // ✅ Update progress + UPDATE DAILY
+      await supabase
+        .from('whatsapp_accounts')
+        .update({
+          warmup_stage_progress: current_progress,
+          warmup_daily_sent: new_daily_sent,  // ✅ ADDED!
+          warmup_daily_reset_at: new Date().toISOString(),
+          warmup_last_updated_at: new Date().toISOString()
+        })
+        .eq('wa_id', account_id);
+ 
+      const stage_remaining = current_limit - current_progress;
+      const daily_remaining = current_limit - new_daily_sent;
+      
+      console.log(`   📈 Stage: ${stage_remaining} messages to next stage`);
+      console.log(`   📅 Daily: ${daily_remaining} messages remaining today`);
+    }
+  } catch (error) {
+    console.error('   ⚠️  Error updating warm-up progress:', error);
+  }
+}
+
+/* =====================================
+   SEND WHATSAPP MESSAGE (UNCHANGED)
 ====================================== */
 
 async function sendWhatsAppMessage(
@@ -457,7 +602,6 @@ async function sendWhatsAppMessage(
     }
 
     // Handle BODY VARIABLES
-    // ✅ FIX: Parse variables if it's a string
     let parsedVariables = variables;
     if (typeof variables === 'string') {
       try {
@@ -491,7 +635,7 @@ async function sendWhatsAppMessage(
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
-        timeout: 30000, // 30 second timeout
+        timeout: 30000,
       }
     );
 
@@ -515,7 +659,6 @@ async function sendWhatsAppMessage(
 
     if (wmError) {
       console.error('   ⚠️  Failed to store in whatsapp_messages:', wmError);
-      // Don't throw - message was sent successfully
     }
 
     // Find or create chat
@@ -544,12 +687,11 @@ async function sendWhatsAppMessage(
 }
 
 /* =====================================
-   HELPER: FIND OR CREATE CHAT
+   HELPER FUNCTIONS (UNCHANGED)
 ====================================== */
 
 async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
   try {
-    // Check if chat exists
     const { data: existingChats } = await supabase
       .from('chats')
       .select('chat_id, group_id, person_name')
@@ -561,7 +703,6 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
     if (existingChats && existingChats.length > 0) {
       const existingChat = existingChats[0];
 
-      // Update existing chat
       await supabase
         .from('chats')
         .update({
@@ -577,7 +718,6 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
       return existingChat.chat_id;
     }
 
-    // Create new chat
     const { data: newChat, error } = await supabase
       .from('chats')
       .insert({
@@ -602,14 +742,9 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
     return newChat.chat_id;
   } catch (err) {
     console.error('   ⚠️  Error in findOrCreateChat:', err.message);
-    // Return null if chat creation fails - message was still sent
     return null;
   }
 }
-
-/* =====================================
-   HELPER: EXTRACT TEMPLATE TEXT
-====================================== */
 
 function extractTemplateText(template) {
   try {
@@ -638,10 +773,6 @@ function extractTemplateText(template) {
   }
 }
 
-/* =====================================
-   HELPER: MARK CAMPAIGN AS COMPLETED
-====================================== */
-
 async function markCampaignCompleted(campaignId, sent, failed) {
   try {
     await supabase
@@ -657,10 +788,6 @@ async function markCampaignCompleted(campaignId, sent, failed) {
     console.error('   ⚠️  Error marking campaign as completed:', err);
   }
 }
-
-/* =====================================
-   HELPER: SLEEP FUNCTION
-====================================== */
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
