@@ -867,7 +867,7 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
         last_admin_message_at: new Date().toISOString(),
         user_id: userId,
         status: "active",
-        unread_count: 0,
+        // unread_count: 0,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })

@@ -4,6 +4,7 @@
 import dotenv from "dotenv";
 import { startCampaignScheduler } from "./campaignScheduler.js";
 import { startDailyResetCron } from "./dailyResetJob.js";
+import { startAssumedFailedCron } from "./assumedFailedJob.js";
 
 // Load environment variables
 dotenv.config();
@@ -44,6 +45,7 @@ console.log("\n⏰ Starting cron job (runs every minute)...");
 try {
   startCampaignScheduler();
   startDailyResetCron();
+  startAssumedFailedCron();
   console.log("✅ Scheduler is running successfully!");
   console.log("🔄 Checking for campaigns every 60 seconds");
   console.log("💡 Press Ctrl+C to stop (or let Render manage it)");
