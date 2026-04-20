@@ -796,6 +796,8 @@ async function sendWhatsAppMessage(
       contactName,
       groupId,
       userId,
+      templateText, // ← pass actual text
+      campaignMediaId, // ← pass media
     );
 
     // Store in messages table
@@ -804,9 +806,8 @@ async function sendWhatsAppMessage(
       sender_type: "admin",
       message: templateText,
       message_type: "template",
-      wa_message_id: wa_message_id,
-      status: "sent",
-      created_at: new Date().toISOString(),
+      media_path: campaignMediaId || null, // ← was missing
+      created_at: new Date().toISOString(), // removed wa_message_id & status
     });
 
     return {
@@ -827,7 +828,14 @@ async function sendWhatsAppMessage(
    HELPER FUNCTIONS (UNCHANGED)
 ====================================== */
 
-async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
+async function findOrCreateChat(
+  phoneNumber,
+  contactName,
+  groupId,
+  userId,
+  lastMessage = "Template message sent via campaign",
+  mediaId = null,
+) {
   try {
     const { data: existingChats } = await supabase
       .from("chats")
@@ -843,7 +851,7 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
       await supabase
         .from("chats")
         .update({
-          last_message: "Template message sent via campaign",
+          last_message: lastMessage, // ← was hardcoded
           last_message_at: new Date().toISOString(),
           last_admin_message_at: new Date().toISOString(),
           group_id: groupId,
@@ -860,14 +868,13 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
       .insert({
         phone_number: phoneNumber,
         person_name: contactName || "Unknown",
-        last_message: "Template message sent via campaign",
+        last_message: lastMessage, // ← was hardcoded
         last_message_at: new Date().toISOString(),
         group_id: groupId,
         mode: "AUTO",
         last_admin_message_at: new Date().toISOString(),
         user_id: userId,
         status: "active",
-        // unread_count: 0,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
