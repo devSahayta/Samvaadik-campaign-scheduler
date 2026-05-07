@@ -7,6 +7,7 @@ import { startDailyResetCron } from "./dailyResetJob.js";
 import { startAssumedFailedCron } from "./assumedFailedJob.js";
 import { startCartRecoveryCron } from "./cartRecoveryJob.js";
 import { startScheduledMessageCron } from "./scheduledMessageJob.js";
+import { startDailyDigestCron } from "./dailyNotificationDigest.js";
 // Load environment variables
 dotenv.config();
 
@@ -49,6 +50,7 @@ try {
   startAssumedFailedCron();
   startCartRecoveryCron();
   startScheduledMessageCron();
+  startDailyDigestCron();
   console.log("✅ Scheduler is running successfully!");
   console.log("🔄 Checking for campaigns every 60 seconds");
   console.log("💡 Press Ctrl+C to stop (or let Render manage it)");
