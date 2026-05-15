@@ -29,3 +29,6 @@ Thumbs.db
 # Temporary files
 tmp/
 temp/
+
+# Test scripts (local only)
+testMediaExpiry.js

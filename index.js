@@ -8,6 +8,8 @@ import { startAssumedFailedCron } from "./assumedFailedJob.js";
 import { startCartRecoveryCron } from "./cartRecoveryJob.js";
 import { startScheduledMessageCron } from "./scheduledMessageJob.js";
 import { startDailyDigestCron } from "./dailyNotificationDigest.js";
+import { startMediaExpiryCron } from "./mediaExpiryJob.js"; // ← NEW
+
 // Load environment variables
 dotenv.config();
 
@@ -42,8 +44,8 @@ console.log(
   process.env.SUPABASE_SERVICE_ROLE_KEY?.substring(0, 20) + "...",
 );
 
-// Start the campaign scheduler
-console.log("\n⏰ Starting cron job (runs every minute)...");
+// Start all cron jobs
+console.log("\n⏰ Starting cron jobs...");
 try {
   startCampaignScheduler();
   startDailyResetCron();
@@ -51,8 +53,10 @@ try {
   startCartRecoveryCron();
   startScheduledMessageCron();
   startDailyDigestCron();
-  console.log("✅ Scheduler is running successfully!");
-  console.log("🔄 Checking for campaigns every 60 seconds");
+  startMediaExpiryCron(); // ← NEW
+  console.log("✅ All schedulers running successfully!");
+  console.log("🔄 Campaign check: every 60 seconds");
+  console.log("🗑️  Media expiry check: daily at 2:00 AM UTC");
   console.log("💡 Press Ctrl+C to stop (or let Render manage it)");
   console.log("════════════════════════════════════════════════════════\n");
 } catch (err) {
@@ -101,10 +105,9 @@ process.on("unhandledRejection", (reason, promise) => {
 });
 
 /* =====================================
-   KEEP-ALIVE (Optional)
+   KEEP-ALIVE
 ====================================== */
 
-// Send heartbeat every 5 minutes to show service is alive
 setInterval(
   () => {
     const now = new Date();
@@ -113,4 +116,4 @@ setInterval(
     );
   },
   5 * 60 * 1000,
-); // Every 5 minutes
+);
