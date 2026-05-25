@@ -879,6 +879,7 @@ async function findOrCreateChat(
           last_message: lastMessage, // ← was hardcoded
           last_message_at: new Date().toISOString(),
           last_admin_message_at: new Date().toISOString(),
+          last_sender_type: "admin",
           group_id: groupId,
           person_name: contactName || existingChat.person_name || "Unknown",
           updated_at: new Date().toISOString(),
@@ -895,6 +896,7 @@ async function findOrCreateChat(
         person_name: contactName || "Unknown",
         last_message: lastMessage, // ← was hardcoded
         last_message_at: new Date().toISOString(),
+        last_sender_type: "admin",
         group_id: groupId,
         mode: "AUTO",
         last_admin_message_at: new Date().toISOString(),
