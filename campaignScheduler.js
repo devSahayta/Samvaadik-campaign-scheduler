@@ -769,7 +769,31 @@ async function sendWhatsAppMessage(
     );
 
     const wa_message_id = response.data.messages?.[0]?.id;
-    const templateText = extractTemplateText(template);
+    // ─── REPLACE WITH THIS ───
+
+    const templateText = buildTemplateMessage(template); // ← renamed + fixed
+    const templateButtons = extractTemplateButtons(template); // ← new
+
+    // Determine message_type based on header media format
+    let components = template.components;
+    if (typeof components === "string") {
+      try {
+        components = JSON.parse(components);
+      } catch {
+        components = [];
+      }
+    }
+    const headerComp = Array.isArray(components)
+      ? components.find((c) => c.type === "HEADER")
+      : null;
+    const headerFormat = headerComp?.format?.toUpperCase();
+
+    const messageType =
+      headerFormat === "VIDEO"
+        ? "template_video"
+        : headerFormat === "DOCUMENT"
+          ? "template_document"
+          : "template"; // covers IMAGE and TEXT headers
 
     // Store in whatsapp_messages table
     const { data: wmRecord, error: wmError } = await supabase
@@ -796,18 +820,19 @@ async function sendWhatsAppMessage(
       contactName,
       groupId,
       userId,
-      templateText, // ← pass actual text
-      campaignMediaId, // ← pass media
+      templateText,
+      campaignMediaId,
     );
 
-    // Store in messages table
+    // Store in messages table — now includes buttons + correct message_type
     await supabase.from("messages").insert({
       chat_id: chatId,
       sender_type: "admin",
       message: templateText,
-      message_type: "template",
-      media_path: campaignMediaId || null, // ← was missing
-      created_at: new Date().toISOString(), // removed wa_message_id & status
+      message_type: messageType,
+      media_path: campaignMediaId || null,
+      buttons: templateButtons, // ← was null before
+      created_at: new Date().toISOString(),
     });
 
     return {
@@ -890,30 +915,71 @@ async function findOrCreateChat(
   }
 }
 
-function extractTemplateText(template) {
-  try {
-    if (!template.components || !Array.isArray(template.components)) {
-      return `Template: ${template.name}`;
-    }
+// ─── REPLACE the existing extractTemplateText function with this ───
 
+function buildTemplateMessage(template) {
+  try {
     let components = template.components;
     if (typeof components === "string") {
       try {
         components = JSON.parse(components);
-      } catch (e) {
+      } catch {
         return `Template: ${template.name}`;
       }
     }
+    if (!Array.isArray(components)) return `Template: ${template.name}`;
 
-    const bodyComponent = components.find((comp) => comp.type === "BODY");
+    const parts = [];
 
-    if (bodyComponent && bodyComponent.text) {
-      return bodyComponent.text;
+    // HEADER (TEXT only — image/video headers are shown via media_path)
+    const header = components.find((c) => c.type === "HEADER");
+    if (header?.format === "TEXT" && header?.text) {
+      parts.push(`**${header.text}**`);
     }
 
+    // BODY
+    const body = components.find((c) => c.type === "BODY");
+    if (body?.text) {
+      parts.push(body.text);
+    }
+
+    // FOOTER
+    const footer = components.find((c) => c.type === "FOOTER");
+    if (footer?.text) {
+      parts.push(`_${footer.text}_`);
+    }
+
+    return parts.length > 0 ? parts.join("\n\n") : `Template: ${template.name}`;
+  } catch {
     return `Template: ${template.name}`;
-  } catch (err) {
-    return `Template: ${template.name}`;
+  }
+}
+
+function extractTemplateButtons(template) {
+  try {
+    let components = template.components;
+    if (typeof components === "string") {
+      try {
+        components = JSON.parse(components);
+      } catch {
+        return null;
+      }
+    }
+    if (!Array.isArray(components)) return null;
+
+    const btnComp = components.find((c) => c.type === "BUTTONS");
+    if (!btnComp?.buttons?.length) return null;
+
+    return JSON.stringify(
+      btnComp.buttons.map((b) => ({
+        type: b.type,
+        text: b.text,
+        ...(b.url ? { url: b.url } : {}),
+        ...(b.phone_number ? { phone_number: b.phone_number } : {}),
+      })),
+    );
+  } catch {
+    return null;
   }
 }
 
