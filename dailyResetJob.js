@@ -1,3 +1,5 @@
+// dailyResetJob.js
+
 import cron from "node-cron";
 import { createClient } from "@supabase/supabase-js";
 

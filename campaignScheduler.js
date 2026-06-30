@@ -71,10 +71,11 @@ export async function checkAndSendCampaigns() {
   console.log(`\n🔍 [${now.toISOString()}] Checking for campaigns...`);
 
   try {
+    // Fetch both scheduled AND orphaned processing campaigns
     const { data: campaigns, error } = await supabase
       .from("campaigns")
       .select("*")
-      .eq("status", "scheduled")
+      .in("status", ["scheduled", "processing"]) // ← add "processing" here
       .lte("scheduled_at", now.toISOString())
       .order("scheduled_at", { ascending: true })
       .limit(5);
