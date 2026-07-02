@@ -10,6 +10,10 @@ import { startScheduledMessageCron } from "./scheduledMessageJob.js";
 import { startDailyDigestCron } from "./dailyNotificationDigest.js";
 import { startMediaExpiryCron } from "./mediaExpiryJob.js"; // ← NEW
 import { startOrderDelayCron } from "./orderDelayJob.js";
+import {
+  startWhatsappStatusSyncCron,
+  startWhatsappStatusEventsCleanupCron,
+} from "./whatsappStatusSyncJob.js";
 
 // Load environment variables
 dotenv.config();
@@ -56,11 +60,17 @@ try {
   startDailyDigestCron();
   startMediaExpiryCron();
   startOrderDelayCron();
+  startWhatsappStatusSyncCron();
+  startWhatsappStatusEventsCleanupCron();
 
   console.log("✅ All schedulers running successfully!");
   console.log("🔄 Campaign check: every 60 seconds");
   console.log("🗑️  Media expiry check: daily at 2:00 AM UTC");
   console.log("⏳ Order delay check: every 1 hour");
+  console.log("📨 WhatsApp status sync check: every 60 seconds");
+  console.log(
+    "🧹 WhatsApp status events cleanup: daily at 3:00 AM UTC (7-day retention)",
+  );
   console.log("💡 Press Ctrl+C to stop (or let Render manage it)");
   console.log("════════════════════════════════════════════════════════\n");
 } catch (err) {
