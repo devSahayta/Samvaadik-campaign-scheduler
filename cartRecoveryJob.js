@@ -33,8 +33,9 @@ function normalizePhone(phone, countryCode = "91") {
 
 function buildVariables(order, varMap) {
   const billing = order.billing || {};
+  const shipping = order.shipping || {};
   const fullName =
-    `${billing.first_name || ""} ${billing.last_name || ""}`.trim();
+    `${billing.first_name || shipping.first_name || ""} ${billing.last_name || shipping.last_name || ""}`.trim();
   const itemNames = (order.line_items || [])
     .map((i) => decode(i.name))
     .join(", ");
@@ -289,11 +290,14 @@ async function processConnection(connection, automation, account, template) {
         continue;
       }
 
-      // Must have phone number
-      const rawPhone = order.billing?.phone;
+      // Must have phone number. On this checkout, the Phone field lives
+      // under the Shipping section — WC Blocks doesn't always mirror it
+      // into billing.phone until the order is actually placed, so we
+      // check shipping as a fallback for draft orders.
+      const rawPhone = order.billing?.phone || order.shipping?.phone;
       if (!rawPhone) {
         console.log(
-          `   ⏭️  Order ${order.id} skipped: no phone number on checkout draft`,
+          `   ⏭️  Order ${order.id} skipped: no phone number on checkout draft (checked billing.phone and shipping.phone)`,
         );
         skipped++;
         continue;
@@ -345,7 +349,7 @@ async function processConnection(connection, automation, account, template) {
             wc_order_id,
             phone_number: phone,
             customer_name:
-              `${order.billing?.first_name || ""} ${order.billing?.last_name || ""}`.trim(),
+              `${order.billing?.first_name || order.shipping?.first_name || ""} ${order.billing?.last_name || order.shipping?.last_name || ""}`.trim(),
             cart_items:
               order.line_items?.map((i) => ({
                 product_id: i.product_id,
