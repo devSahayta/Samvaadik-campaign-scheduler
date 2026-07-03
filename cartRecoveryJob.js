@@ -269,12 +269,25 @@ async function processConnection(connection, automation, account, template) {
   console.log(`   📋 Found ${draftOrders.length} draft order(s)`);
 
   const delayMinutes = automation.delay_minutes || 60;
+  const BOT_UA_PATTERN =
+    /bot|crawler|spider|storebot|slurp|facebookexternalhit/i;
 
   let sent = 0,
     skipped = 0;
 
   for (const order of draftOrders) {
     try {
+      // Skip drafts created by crawlers (e.g. Google's Storebot visiting
+      // checkout to collect shipping/tax data for Merchant Center). These
+      // aren't real abandoned carts and always have empty billing/shipping.
+      if (BOT_UA_PATTERN.test(order.customer_user_agent || "")) {
+        console.log(
+          `   🤖 Order ${order.id} skipped: bot-created draft (UA: ${order.customer_user_agent})`,
+        );
+        skipped++;
+        continue;
+      }
+
       // Skip carts older than 24 hours — too stale to recover.
       // Use date_created (immutable, set once) NOT date_modified — WooCommerce
       // Blocks checkout silently bumps date_modified on session heartbeats,
