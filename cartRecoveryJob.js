@@ -17,12 +17,17 @@ const GRAPH = "https://graph.facebook.com/v21.0";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Returns digits-only, no leading "+" — matches the format already used by
+// the rest of the system (incoming-message chats, order automations) and
+// Meta's documented WhatsApp Cloud API "to" field format. A mismatched
+// format here (e.g. a leading "+") causes duplicate chat rows since the
+// chats_user_phone_unique constraint does an exact string match.
 function normalizePhone(phone, countryCode = "91") {
   if (!phone) return null;
   const digits = phone.replace(/\D/g, "");
-  if (digits.startsWith(countryCode) && digits.length > 10) return `+${digits}`;
-  if (digits.length === 10) return `+${countryCode}${digits}`;
-  if (digits.length > 10) return `+${digits}`;
+  if (digits.startsWith(countryCode) && digits.length > 10) return digits;
+  if (digits.length === 10) return `${countryCode}${digits}`;
+  if (digits.length > 10) return digits;
   return null;
 }
 
