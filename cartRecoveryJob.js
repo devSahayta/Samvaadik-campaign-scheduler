@@ -478,7 +478,9 @@ async function processConnection(connection, automation, account, template) {
         sent++;
         try {
           const templateText = buildTemplateText(template, variables);
-          const contactName = cartEntry.customer_name || "Customer";
+          const contactName =
+            `${order.billing?.first_name || order.shipping?.first_name || ""} ${order.billing?.last_name || order.shipping?.last_name || ""}`.trim() ||
+            "Customer";
 
           const chatId = await findOrCreateWooChat(
             phone,
