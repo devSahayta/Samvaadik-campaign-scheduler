@@ -263,28 +263,22 @@ async function processConnection(connection, automation, account, template) {
   console.log(`   📋 Found ${draftOrders.length} draft order(s)`);
 
   const delayMinutes = automation.delay_minutes || 60;
-  const cutoffTime = new Date(Date.now() - delayMinutes * 60 * 1000);
 
   let sent = 0,
     skipped = 0;
 
   for (const order of draftOrders) {
     try {
-      // Check if cart is old enough to be considered abandoned
-      const lastModified = new Date(order.date_modified);
-      if (lastModified > cutoffTime) {
-        console.log(
-          `   ⏭️  Order ${order.id} skipped: too recent (modified ${order.date_modified}, need ${delayMinutes}min delay)`,
-        );
-        skipped++;
-        continue;
-      }
-
-      // Skip carts older than 24 hours — too stale to recover
+      // Skip carts older than 24 hours — too stale to recover.
+      // Use date_created (immutable, set once) NOT date_modified — WooCommerce
+      // Blocks checkout silently bumps date_modified on session heartbeats,
+      // shipping recalcs, etc, even when the customer isn't actively doing
+      // anything, which previously made carts look "fresh" forever.
+      const createdAt = new Date(order.date_created);
       const maxAge = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      if (lastModified < maxAge) {
+      if (createdAt < maxAge) {
         console.log(
-          `   ⏭️  Order ${order.id} skipped: too old (modified ${order.date_modified}, >24h)`,
+          `   ⏭️  Order ${order.id} skipped: too old (created ${order.date_created}, >24h)`,
         );
         skipped++;
         continue;
@@ -311,15 +305,17 @@ async function processConnection(connection, automation, account, template) {
 
       const wc_order_id = String(order.id);
 
-      // Check if already processed
+      // Check if we're already tracking / have already processed this order.
+      // created_at on THIS row is what we treat as "first seen" — it never
+      // moves, unlike WooCommerce's date_modified.
       const { data: existing } = await supabase
         .from("woocommerce_cart_recovery")
-        .select("id, status")
+        .select("id, status, created_at")
         .eq("connection_id", connection.id)
         .eq("wc_order_id", wc_order_id)
         .maybeSingle();
 
-      if (existing) {
+      if (existing && existing.status !== "pending") {
         console.log(
           `   ⏭️  Order ${wc_order_id} skipped: already processed (status: ${existing.status})`,
         );
@@ -331,43 +327,71 @@ async function processConnection(connection, automation, account, template) {
       const firstItem = order.line_items?.[0];
       const productImageUrl = firstItem?.image?.src || null;
 
-      // Save to cart recovery table
-      const cartEntry = {
-        user_id: connection.user_id,
-        connection_id: connection.id,
-        wc_order_id,
-        phone_number: phone,
-        customer_name:
-          `${order.billing?.first_name || ""} ${order.billing?.last_name || ""}`.trim(),
-        cart_items:
-          order.line_items?.map((i) => ({
-            product_id: i.product_id,
-            name: i.name,
-            quantity: i.quantity,
-            total: i.total,
-            image: i.image?.src,
-          })) || [],
-        cart_total: order.total,
-        cart_currency: order.currency || "INR",
-        checkout_url: order.payment_url || "",
-        product_image_url: productImageUrl,
-        status: "sending",
-      };
+      let cartRecord;
 
-      const { data: cartRecord, error: insertErr } = await supabase
-        .from("woocommerce_cart_recovery")
-        .insert(cartEntry)
-        .select()
-        .single();
+      if (!existing) {
+        // First time we've seen this draft order — start tracking it, but
+        // don't send yet. This stamps OUR OWN first-seen time via created_at.
+        const { data: newRecord, error: insertErr } = await supabase
+          .from("woocommerce_cart_recovery")
+          .insert({
+            user_id: connection.user_id,
+            connection_id: connection.id,
+            wc_order_id,
+            phone_number: phone,
+            customer_name:
+              `${order.billing?.first_name || ""} ${order.billing?.last_name || ""}`.trim(),
+            cart_items:
+              order.line_items?.map((i) => ({
+                product_id: i.product_id,
+                name: i.name,
+                quantity: i.quantity,
+                total: i.total,
+                image: i.image?.src,
+              })) || [],
+            cart_total: order.total,
+            cart_currency: order.currency || "INR",
+            checkout_url: order.payment_url || "",
+            product_image_url: productImageUrl,
+            status: "pending",
+          })
+          .select()
+          .single();
 
-      if (insertErr) {
-        console.warn(
-          `   ⚠️  DB insert failed for order ${wc_order_id}:`,
-          insertErr.message,
+        if (insertErr) {
+          console.warn(
+            `   ⚠️  DB insert failed for order ${wc_order_id}:`,
+            insertErr.message,
+          );
+          skipped++;
+          continue;
+        }
+
+        console.log(
+          `   👀 Order ${wc_order_id} first seen — tracking started, will recheck in ${delayMinutes}min`,
         );
         skipped++;
         continue;
       }
+
+      // We've seen this order before (status === "pending") — check if
+      // enough time has passed since OUR first-seen timestamp.
+      const firstSeenAt = new Date(existing.created_at);
+      const elapsedMinutes = (Date.now() - firstSeenAt.getTime()) / 60000;
+
+      if (elapsedMinutes < delayMinutes) {
+        console.log(
+          `   ⏭️  Order ${wc_order_id} skipped: too recent (first seen ${existing.created_at}, ${Math.round(elapsedMinutes)}min elapsed, need ${delayMinutes}min)`,
+        );
+        skipped++;
+        continue;
+      }
+
+      cartRecord = { id: existing.id };
+      await supabase
+        .from("woocommerce_cart_recovery")
+        .update({ status: "sending", updated_at: new Date().toISOString() })
+        .eq("id", existing.id);
 
       // Upload product image if automation has include_product_image
       let mediaId = null;
