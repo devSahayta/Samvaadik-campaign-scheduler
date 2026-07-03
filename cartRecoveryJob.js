@@ -1,12 +1,11 @@
 // scheduler/cartRecoveryJob.js
-// Abandoned Cart Recovery — runs every 30 minutes
+// Abandoned Cart Recovery — runs every 10 minutes
 // Fetches checkout-draft orders from WooCommerce and sends WhatsApp recovery messages
 
 import cron from "node-cron";
 import { createClient } from "@supabase/supabase-js";
 import axios from "axios";
 import FormData from "form-data";
-// Add this import at the top
 import { decode } from "html-entities";
 
 const supabase = createClient(
@@ -31,9 +30,8 @@ function buildVariables(order, varMap) {
   const billing = order.billing || {};
   const fullName =
     `${billing.first_name || ""} ${billing.last_name || ""}`.trim();
-  // In buildVariables, update itemNames:
   const itemNames = (order.line_items || [])
-    .map((i) => decode(i.name)) // ✅ decode HTML entities
+    .map((i) => decode(i.name))
     .join(", ");
 
   const SOURCE = {
@@ -49,6 +47,32 @@ function buildVariables(order, varMap) {
     result[pos] = SOURCE[field] || "";
   }
   return result;
+}
+
+// Renders a human-readable version of the sent template for storage in the
+// chat thread (best-effort — falls back to a simple summary if the template
+// body can't be parsed).
+function buildTemplateText(template, variables) {
+  try {
+    let comps = template.components;
+    if (typeof comps === "string") comps = JSON.parse(comps);
+    const bodyComp = Array.isArray(comps)
+      ? comps.find((c) => c.type === "BODY")
+      : null;
+    if (bodyComp?.text) {
+      let text = bodyComp.text;
+      for (const [pos, value] of Object.entries(variables)) {
+        text = text.replace(
+          new RegExp(`\\{\\{${pos}\\}\\}`, "g"),
+          String(value),
+        );
+      }
+      return text;
+    }
+  } catch {
+    // fall through to fallback below
+  }
+  return Object.values(variables).filter(Boolean).join(" · ") || template.name;
 }
 
 async function uploadImageToMeta(imageUrl, account) {
@@ -142,6 +166,68 @@ async function sendRecoveryMessage(
   return response.data?.messages?.[0]?.id;
 }
 
+// Mirrors the findOrCreateWooChat pattern used by the order-notification flow
+// (Vercel backend). Uses upsert on the chats_user_phone_unique constraint
+// (user_id, phone_number) so concurrent calls can't create duplicate/racing
+// chat rows or return null.
+async function findOrCreateWooChat(phone, personName, userId, lastMessageText) {
+  try {
+    const { data, error } = await supabase
+      .from("chats")
+      .upsert(
+        {
+          user_id: userId,
+          phone_number: phone,
+          person_name: personName || "Customer",
+          last_message: lastMessageText,
+          last_message_at: new Date().toISOString(),
+          last_sender_type: "admin",
+          last_admin_message_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,phone_number" },
+      )
+      .select("chat_id")
+      .single();
+
+    if (error) {
+      console.error("   ⚠️  findOrCreateWooChat error:", error.message);
+      return null;
+    }
+
+    return data?.chat_id || null;
+  } catch (err) {
+    console.error("   ⚠️  findOrCreateWooChat exception:", err.message);
+    return null;
+  }
+}
+
+async function storeCartRecoveryMessage({ chatId, templateText, mediaPath }) {
+  const { data, error } = await supabase
+    .from("messages")
+    .insert({
+      chat_id: chatId,
+      sender_type: "admin",
+      message: templateText,
+      message_type: "template",
+      media_path: mediaPath || null,
+      buttons: null,
+      created_at: new Date().toISOString(),
+    })
+    .select("message_id")
+    .single();
+
+  if (error) {
+    console.error("   ❌ Failed to store message:", error.message);
+    return null;
+  }
+
+  console.log(
+    `   💬 Stored in chat dashboard — chat_id: ${chatId}, message_id: ${data.message_id}`,
+  );
+  return data.message_id;
+}
+
 // ─── Main Recovery Logic ──────────────────────────────────────────────────────
 
 async function processConnection(connection, automation, account, template) {
@@ -185,29 +271,40 @@ async function processConnection(connection, automation, account, template) {
   for (const order of draftOrders) {
     try {
       // Check if cart is old enough to be considered abandoned
-      // Check if cart is old enough to be considered abandoned
       const lastModified = new Date(order.date_modified);
       if (lastModified > cutoffTime) {
+        console.log(
+          `   ⏭️  Order ${order.id} skipped: too recent (modified ${order.date_modified}, need ${delayMinutes}min delay)`,
+        );
         skipped++;
-        continue; // Too recent — not abandoned yet
+        continue;
       }
 
-      // ✅ Skip carts older than 24 hours — too stale to recover
+      // Skip carts older than 24 hours — too stale to recover
       const maxAge = new Date(Date.now() - 24 * 60 * 60 * 1000);
       if (lastModified < maxAge) {
+        console.log(
+          `   ⏭️  Order ${order.id} skipped: too old (modified ${order.date_modified}, >24h)`,
+        );
         skipped++;
-        continue; // Too old
+        continue;
       }
 
       // Must have phone number
       const rawPhone = order.billing?.phone;
       if (!rawPhone) {
+        console.log(
+          `   ⏭️  Order ${order.id} skipped: no phone number on checkout draft`,
+        );
         skipped++;
         continue;
       }
 
       const phone = normalizePhone(rawPhone);
       if (!phone) {
+        console.log(
+          `   ⏭️  Order ${order.id} skipped: phone "${rawPhone}" could not be normalized`,
+        );
         skipped++;
         continue;
       }
@@ -223,8 +320,11 @@ async function processConnection(connection, automation, account, template) {
         .maybeSingle();
 
       if (existing) {
+        console.log(
+          `   ⏭️  Order ${wc_order_id} skipped: already processed (status: ${existing.status})`,
+        );
         skipped++;
-        continue; // Already sent or processed
+        continue;
       }
 
       // Get product image from line items (already in draft order response)
@@ -326,8 +426,43 @@ async function processConnection(connection, automation, account, template) {
         })
         .eq("id", cartRecord.id);
 
-      if (sendStatus === "sent") sent++;
-      else skipped++;
+      // Store in chats/messages so it shows in the chat dashboard —
+      // same pattern as order.created / order.updated automations.
+      if (sendStatus === "sent") {
+        sent++;
+        try {
+          const templateText = buildTemplateText(template, variables);
+          const contactName = cartEntry.customer_name || "Customer";
+
+          const chatId = await findOrCreateWooChat(
+            phone,
+            contactName,
+            connection.user_id,
+            templateText,
+          );
+
+          if (chatId) {
+            await storeCartRecoveryMessage({
+              chatId,
+              templateText,
+              mediaPath: automation.include_product_image
+                ? productImageUrl
+                : null,
+            });
+          } else {
+            console.error(
+              `   ❌ chatId is null — skipping message insert for order ${wc_order_id}`,
+            );
+          }
+        } catch (chatErr) {
+          console.error(
+            `   ⚠️  Chat/message storage failed for order ${wc_order_id}:`,
+            chatErr.message,
+          );
+        }
+      } else {
+        skipped++;
+      }
     } catch (err) {
       console.error(`   ❌ Error processing order ${order.id}:`, err.message);
       skipped++;
@@ -427,12 +562,12 @@ async function runCartRecoveryCron() {
 
 export function startCartRecoveryCron() {
   cron.schedule(
-    "*/30 * * * *", // Every 3 minutes
+    "*/10 * * * *", // Every 10 minutes — tighter than delay_minutes to keep sends on time
     runCartRecoveryCron,
     { timezone: "UTC" },
   );
 
-  console.log("⏰ Cart recovery cron started (every 3 minutes)");
+  console.log("⏰ Cart recovery cron started (every 10 minutes)");
 }
 
 // Export for manual testing
