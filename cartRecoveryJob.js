@@ -208,7 +208,12 @@ async function findOrCreateWooChat(phone, personName, userId, lastMessageText) {
   }
 }
 
-async function storeCartRecoveryMessage({ chatId, templateText, mediaPath }) {
+async function storeCartRecoveryMessage({
+  chatId,
+  templateText,
+  mediaPath,
+  wmId,
+}) {
   const { data, error } = await supabase
     .from("messages")
     .insert({
@@ -218,6 +223,7 @@ async function storeCartRecoveryMessage({ chatId, templateText, mediaPath }) {
       message_type: "template",
       media_path: mediaPath || null,
       buttons: null,
+      wm_id: wmId,
       created_at: new Date().toISOString(),
     })
     .select("message_id")
@@ -496,6 +502,7 @@ async function processConnection(connection, automation, account, template) {
               mediaPath: automation.include_product_image
                 ? productImageUrl
                 : null,
+              wmId: waMessageId,
             });
           } else {
             console.error(

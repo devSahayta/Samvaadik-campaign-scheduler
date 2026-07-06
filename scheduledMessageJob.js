@@ -285,6 +285,7 @@ async function sendWhatsAppMessage(account, template, msg) {
       message_type: "template",
       media_path: msg.media_id || null,
       buttons: templateButtons,
+      wm_id: wmRecord?.wm_id,
       created_at: new Date().toISOString(),
     });
   }

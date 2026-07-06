@@ -833,6 +833,7 @@ async function sendWhatsAppMessage(
       message_type: messageType,
       media_path: campaignMediaId || null,
       buttons: templateButtons, // ← was null before
+      wm_id: wmRecord?.wm_id,
       created_at: new Date().toISOString(),
     });
 

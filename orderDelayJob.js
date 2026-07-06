@@ -363,6 +363,7 @@ export async function runOrderDelayCron() {
               phone_number: phone,
               status: "sent",
               sent_at: new Date().toISOString(),
+              wm_id: wa_message_id,
             });
 
             console.log(`   ✅ Delay notice sent! WA ID: ${wa_message_id}`);
