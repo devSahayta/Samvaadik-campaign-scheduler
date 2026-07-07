@@ -208,6 +208,42 @@ async function findOrCreateWooChat(phone, personName, userId, lastMessageText) {
   }
 }
 
+// Creates the whatsapp_messages tracking row your colleague's delivery-status
+// (tick) system reads/updates. wa_message_id holds the real Meta wamid string;
+// this row's own uuid (wm_id) is what messages.wm_id links to via FK.
+async function createWhatsAppMessageRecord({
+  account,
+  toNumber,
+  templateName,
+  messageBody,
+  waMessageId,
+}) {
+  const { data, error } = await supabase
+    .from("whatsapp_messages")
+    .insert({
+      account_id: account.wa_id,
+      to_number: toNumber,
+      template_name: templateName,
+      message_body: messageBody,
+      wa_message_id: waMessageId,
+      status: "sent",
+      created_at: new Date().toISOString(),
+      sent_at: new Date().toISOString(),
+    })
+    .select("wm_id")
+    .single();
+
+  if (error) {
+    console.error(
+      "   ⚠️  Failed to create whatsapp_messages record:",
+      error.message,
+    );
+    return null;
+  }
+
+  return data?.wm_id || null;
+}
+
 async function storeCartRecoveryMessage({
   chatId,
   templateText,
@@ -223,7 +259,7 @@ async function storeCartRecoveryMessage({
       message_type: "template",
       media_path: mediaPath || null,
       buttons: null,
-      wm_id: wmId,
+      wm_id: wmId || null,
       created_at: new Date().toISOString(),
     })
     .select("message_id")
@@ -235,7 +271,7 @@ async function storeCartRecoveryMessage({
   }
 
   console.log(
-    `   💬 Stored in chat dashboard — chat_id: ${chatId}, message_id: ${data.message_id}`,
+    `   💬 Stored in chat dashboard — chat_id: ${chatId}, message_id: ${data.message_id}${wmId ? `, wm_id: ${wmId}` : ""}`,
   );
   return data.message_id;
 }
@@ -488,6 +524,17 @@ async function processConnection(connection, automation, account, template) {
             `${order.billing?.first_name || order.shipping?.first_name || ""} ${order.billing?.last_name || order.shipping?.last_name || ""}`.trim() ||
             "Customer";
 
+          // Create the whatsapp_messages tracking row FIRST — this is what
+          // the tick-status (sent/delivered/read) feature reads and updates
+          // by matching wa_message_id against incoming webhook callbacks.
+          const wmId = await createWhatsAppMessageRecord({
+            account,
+            toNumber: phone,
+            templateName: template.name,
+            messageBody: variables,
+            waMessageId,
+          });
+
           const chatId = await findOrCreateWooChat(
             phone,
             contactName,
@@ -502,7 +549,7 @@ async function processConnection(connection, automation, account, template) {
               mediaPath: automation.include_product_image
                 ? productImageUrl
                 : null,
-              wmId: waMessageId,
+              wmId,
             });
           } else {
             console.error(
