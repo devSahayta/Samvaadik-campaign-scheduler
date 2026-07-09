@@ -15,6 +15,8 @@ import {
   startWhatsappStatusEventsCleanupCron,
 } from "./whatsappStatusSyncJob.js";
 
+import { startReconciliationCron } from "./orderReconciliationJob.js";
+
 // Load environment variables
 dotenv.config();
 
@@ -62,16 +64,19 @@ try {
   startOrderDelayCron();
   startWhatsappStatusSyncCron();
   startWhatsappStatusEventsCleanupCron();
+  startReconciliationCron();
 
   console.log("✅ All schedulers running successfully!");
   console.log("🔄 Campaign check: every 60 seconds");
   console.log("🗑️  Media expiry check: daily at 2:00 AM UTC");
   console.log("⏳ Order delay check: every 1 hour");
   console.log("📨 WhatsApp status sync check: every 60 seconds");
+  console.log("🔄 Order reconciliation check: every 15 minutes");
   console.log(
     "🧹 WhatsApp status events cleanup: daily at 3:00 AM UTC (7-day retention)",
   );
   console.log("💡 Press Ctrl+C to stop (or let Render manage it)");
+
   console.log("════════════════════════════════════════════════════════\n");
 } catch (err) {
   console.error("❌ Failed to start scheduler:", err);
