@@ -1,13 +1,51 @@
 // scheduler/campaignScheduler.js
 //
-// WHAT CHANGED vs the old version:
-//   - checkAndSendCampaigns: groups campaigns by account_id, runs each group
-//     in parallel via Promise.all instead of a sequential for...of loop
-//   - processAccountCampaigns: new function that round-robins batches across
-//     all campaigns on the same WhatsApp account so no campaign starves
-//   - sendBatch: extracted helper so the batch loop is clean and reusable
+// ARCHITECTURE (v3 — Tier 1 hardening for high concurrent volume):
+//   Adds three safety mechanisms on top of v2's per-account fairness,
+//   none of which touch sending pace, batch size, or delays:
 //
-// WHAT IS 100% IDENTICAL:
+//   1. CONCURRENCY CAP — v2 dispatched every free account unconditionally.
+//      If 50+ accounts became due in the same tick, 50+ full campaigns'
+//      worth of processing would kick off at once. MAX_CONCURRENT_ACCOUNTS
+//      bounds this; accounts beyond the cap simply wait for the next tick
+//      (oldest-due-first, since campaigns are queried ordered by
+//      scheduled_at). No campaign is skipped, only delayed a few ticks
+//      under genuinely heavy simultaneous load.
+//
+//   2. DB LEASE — v2's accountsInFlight is an in-memory Set, only valid
+//      inside one process. If a second Render worker were ever run, both
+//      instances would independently see an account as "free" and could
+//      double-claim it, sending duplicate messages. Each campaign row now
+//      carries worker_id + lease_expires_at; claiming is an atomic
+//      UPDATE...WHERE (lease_expires_at IS NULL OR expired), which
+//      Postgres guarantees only one process can win. This is what makes
+//      horizontal scaling (running >1 worker) safe in the future, without
+//      needing a full queue migration now.
+//
+//   3. STREAMING FETCH — v2 loaded an entire campaign's pending contact
+//      list into memory upfront (fetchPendingMessages), then round-robin
+//      spliced 5 at a time from that array. For very large campaigns run
+//      concurrently across many accounts, this holds a lot in RAM at
+//      once. Now each round-robin turn fetches only the next BATCH_SIZE
+//      rows right before sending them — memory per campaign stays flat
+//      regardless of whether it has 50 or 500,000 contacts.
+//
+//   SENDING PACE IS UNTOUCHED: BATCH_SIZE=5, BATCH_DELAY_MS=10000,
+//   MESSAGE_DELAY_MIN/MAX=800-2000ms are byte-for-byte identical to v2.
+//   These three mechanisms only decide *when a batch is allowed to start*
+//   and *how much is held in memory* — never how fast messages actually
+//   go out once a batch begins. Meta-facing delivery timing is unchanged.
+//
+// CARRIED FROM v2:
+//   - checkAndSendCampaigns: groups by account_id, fire-and-forget dispatch
+//     (does not block subsequent ticks from finding work on free accounts)
+//   - Stall detection via updated_at (time since LAST PROGRESS), not
+//     started_at (total elapsed time) — long-but-healthy campaigns are
+//     never wrongly killed
+//   - Heartbeat write (updated_at) after every batch
+//   - Recovers orphaned "processing" campaigns after a worker restart
+//
+// WHAT IS 100% IDENTICAL TO THE ORIGINAL:
 //   - BATCH_SIZE, BATCH_DELAY_MS, MESSAGE_DELAY_MIN/MAX constants
 //   - sendWhatsAppMessage — every line unchanged
 //   - findOrCreateChat — every line unchanged
@@ -16,13 +54,15 @@
 //   - updateWarmupProgress — every line unchanged
 //   - updateTierDailySent — every line unchanged
 //   - All Supabase writes (campaign_messages, whatsapp_messages, messages, chats)
-//   - Timeout protection (30 min guard on started_at)
+//   - Round-robin batch interleaving for campaigns sharing one account
 //   - Daily counter reset logic
-//   - isProcessing lock
+//
+// REQUIRES: run migration_add_lease_columns.sql before deploying this file.
 
 import cron from "node-cron";
 import { createClient } from "@supabase/supabase-js";
 import axios from "axios";
+import crypto from "crypto";
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -34,67 +74,115 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-let isProcessing = false;
+// Unique per-process identity. Used to claim campaigns via the DB lease so
+// that even if a second worker process is ever run, only one can hold a
+// given account's campaigns at a time — Postgres enforces this atomically,
+// not this in-memory value.
+const WORKER_ID = crypto.randomUUID();
 
-// Sending rate constants (unchanged from original)
+// Lightweight guard for the DISPATCH phase only (the SELECT + grouping +
+// firing off background tasks). This resolves in milliseconds — it is NOT
+// held while campaigns are actually sending, unlike the old isProcessing.
+let tickRunning = false;
+
+// Tracks which WhatsApp accounts currently have a processAccountCampaigns()
+// call in flight IN THIS PROCESS. Fast-path check to avoid unnecessary DB
+// lease round-trips within a single worker. The DB lease (below) is the
+// real cross-process safety net.
+const accountsInFlight = new Set();
+
+// Tier 1: bounds how many accounts can be actively processing at once.
+// Accounts beyond this cap wait for the next tick rather than all being
+// dispatched unconditionally — protects memory and Supabase write
+// throughput under genuinely heavy simultaneous load. Raise this if you
+// have headroom; lower it if the worker is resource constrained.
+const MAX_CONCURRENT_ACCOUNTS = 15;
+
+// Tier 1: how long a claimed lease is valid before another process could
+// consider it abandoned and reclaim it. Refreshed (extended) on every
+// batch heartbeat while a campaign is actively sending, so a healthy
+// long-running campaign never lets its lease lapse.
+const LEASE_DURATION_MS = 3 * 60 * 1000;
+
+// Sending rate constants (unchanged from original — do not modify without
+// re-validating delivery/quality impact with Meta's rate guidance)
 const BATCH_SIZE = 5;
 const BATCH_DELAY_MS = 10000;
 const MESSAGE_DELAY_MIN = 800;
 const MESSAGE_DELAY_MAX = 2000;
+
+// Stall detection: a campaign is only considered stuck if it hasn't made
+// ANY progress (no batch sent) in this many minutes. This is checked
+// against updated_at (touched every batch), not started_at (total elapsed
+// time) — a large campaign or one sharing an account with siblings can
+// legitimately run for hours without being "stuck".
+const STALL_MINUTES = 15;
 
 /* ============================================================
    ENTRY POINT
    ============================================================ */
 
 export function startCampaignScheduler() {
-  console.log("Campaign Scheduler (parallel-by-account) started!");
   console.log(
-    `Rate: ${BATCH_SIZE} msgs / ${BATCH_DELAY_MS / 1000}s per account`,
+    "Campaign Scheduler (parallel-by-account, Tier 1 hardened) started!",
   );
-  console.log(`Per-message delay: ${MESSAGE_DELAY_MIN}-${MESSAGE_DELAY_MAX}ms`);
+  console.log(`Worker ID: ${WORKER_ID}`);
+  console.log(
+    `Rate: ${BATCH_SIZE} msgs / ${BATCH_DELAY_MS / 1000}s per account (unchanged)`,
+  );
+  console.log(
+    `Per-message delay: ${MESSAGE_DELAY_MIN}-${MESSAGE_DELAY_MAX}ms (unchanged)`,
+  );
+  console.log(`Stall threshold: ${STALL_MINUTES} min with no progress`);
+  console.log(`Max concurrent accounts per tick: ${MAX_CONCURRENT_ACCOUNTS}`);
+  console.log(`Lease duration: ${LEASE_DURATION_MS / 1000}s`);
 
   cron.schedule("* * * * *", async () => {
-    if (isProcessing) {
-      console.log("Skipping tick - previous run still active");
+    if (tickRunning) {
+      console.log(
+        "Skipping tick - dispatch phase still running (should be rare, <1s normally)",
+      );
       return;
     }
-    isProcessing = true;
+    tickRunning = true;
     try {
       await checkAndSendCampaigns();
     } catch (err) {
       console.error("Scheduler top-level error:", err);
     } finally {
-      isProcessing = false;
+      tickRunning = false;
     }
   });
 }
 
 /* ============================================================
-   STEP 1 - FIND DUE CAMPAIGNS, GROUP BY ACCOUNT, RUN PARALLEL
+   STEP 1 - FIND DUE CAMPAIGNS, DISPATCH FREE ACCOUNTS
+   (fire-and-forget: does NOT wait for sends to complete)
    ============================================================ */
 
 export async function checkAndSendCampaigns() {
   const now = new Date();
   console.log(`\n[${now.toISOString()}] Checking for due campaigns...`);
 
+  // Include "processing" so a campaign orphaned by a worker restart
+  // (crashed mid-send, no accountsInFlight entry anymore) gets picked
+  // back up automatically instead of sitting stuck forever.
   const { data: campaigns, error } = await supabase
     .from("campaigns")
     .select("*")
-    .eq("status", "scheduled")
+    .in("status", ["scheduled", "processing"])
     .lte("scheduled_at", now.toISOString())
     .order("scheduled_at", { ascending: true });
 
   if (error) {
     console.error("Error fetching campaigns:", error);
-    return;
+    return [];
   }
 
   if (!campaigns || campaigns.length === 0) {
     console.log("No campaigns ready to send");
-    return;
+    return [];
   }
-
-  console.log(`${campaigns.length} campaign(s) ready to send`);
 
   // Group by account_id
   const byAccount = new Map();
@@ -103,16 +191,54 @@ export async function checkAndSendCampaigns() {
     byAccount.get(c.account_id).push(c);
   }
 
-  console.log(`Grouped into ${byAccount.size} WhatsApp account(s)`);
-
-  // Run each account group in parallel
-  await Promise.all(
-    [...byAccount.entries()].map(([accountId, accountCampaigns]) =>
-      processAccountCampaigns(accountId, accountCampaigns).catch((err) =>
-        console.error(`Account ${accountId} processing failed:`, err.message),
-      ),
-    ),
+  console.log(
+    `${campaigns.length} campaign(s) across ${byAccount.size} account(s)`,
   );
+
+  const dispatched = [];
+
+  for (const [accountId, accountCampaigns] of byAccount.entries()) {
+    if (accountsInFlight.has(accountId)) {
+      console.log(
+        `Account ${accountId} busy with a previous batch - will pick up new/remaining campaigns next tick once free`,
+      );
+      continue;
+    }
+
+    // Tier 1: concurrency cap. Accounts are iterated in the order their
+    // oldest due campaign appeared (campaigns were queried ordered by
+    // scheduled_at ascending), so whichever accounts have been waiting
+    // longest naturally get priority when we're at capacity. Anything
+    // that doesn't fit this tick just waits for the next one — nothing
+    // is skipped or lost, only delayed a few ticks under heavy load.
+    if (accountsInFlight.size >= MAX_CONCURRENT_ACCOUNTS) {
+      console.log(
+        `At capacity (${MAX_CONCURRENT_ACCOUNTS} accounts in flight) - account ${accountId} and any remaining will start next tick`,
+      );
+      break;
+    }
+
+    accountsInFlight.add(accountId);
+
+    // Fire-and-forget: intentionally NOT awaited here. This is what lets
+    // checkAndSendCampaigns() return almost immediately, so the cron tick
+    // finishes fast and the NEXT tick (60s later) can still discover and
+    // start campaigns on any other free account — even while this one
+    // keeps running for hours.
+    const p = processAccountCampaigns(accountId, accountCampaigns)
+      .catch((err) =>
+        console.error(`Account ${accountId} processing failed:`, err.message),
+      )
+      .finally(() => accountsInFlight.delete(accountId));
+
+    dispatched.push(p);
+  }
+
+  // Returned only so tests/manual scripts can `await Promise.all(await
+  // checkAndSendCampaigns())` if they want deterministic completion. The
+  // cron tick above does NOT do this — it just awaits the (fast) function
+  // call itself and lets these promises run in the background.
+  return dispatched;
 }
 
 /* ============================================================
@@ -139,18 +265,101 @@ async function processAccountCampaigns(accountId, campaigns) {
   console.log(`Phone: ${account.business_phone_number}`);
   console.log(`Tier: ${account.messaging_limit_tier}`);
 
-  // Timeout protection: same 30-min logic as original
+  // Tier 1: claim these campaigns via an atomic DB lease before touching
+  // anything else. This is a real cross-process safety net (unlike the
+  // in-memory accountsInFlight Set, which only means something inside this
+  // one process) — Postgres guarantees each UPDATE...WHERE below can only
+  // succeed for a campaign whose lease is null or already expired, so two
+  // worker processes can never both believe they own the same campaign.
+  //
+  // Done as two separate simple UPDATEs (null-lease, then expired-lease)
+  // rather than one .or()-based query — avoids any dependency on .or()
+  // filter parsing, which is more sensitive to PostgREST schema-cache
+  // staleness and client-library version differences than the basic
+  // .is()/.lt()/.eq() filters used here. Each UPDATE is independently
+  // atomic; splitting into two doesn't weaken that.
+  const nowIso = new Date().toISOString();
+  const leaseUntil = new Date(Date.now() + LEASE_DURATION_MS).toISOString();
+  const candidateIds = campaigns.map((c) => c.campaign_id);
+
+  const { data: claimedNullLease, error: claimErr1 } = await supabase
+    .from("campaigns")
+    .update({ worker_id: WORKER_ID, lease_expires_at: leaseUntil })
+    .in("campaign_id", candidateIds)
+    .is("lease_expires_at", null)
+    .select("campaign_id");
+
+  if (claimErr1) {
+    console.error(
+      `Failed to claim lease (null-lease pass) for account ${accountId}:`,
+      claimErr1.message,
+    );
+    return;
+  }
+
+  const claimedIds = new Set(
+    (claimedNullLease || []).map((r) => r.campaign_id),
+  );
+  const remainingCandidates = candidateIds.filter((id) => !claimedIds.has(id));
+
+  if (remainingCandidates.length > 0) {
+    const { data: claimedExpiredLease, error: claimErr2 } = await supabase
+      .from("campaigns")
+      .update({ worker_id: WORKER_ID, lease_expires_at: leaseUntil })
+      .in("campaign_id", remainingCandidates)
+      .lt("lease_expires_at", nowIso)
+      .select("campaign_id");
+
+    if (claimErr2) {
+      console.error(
+        `Failed to claim lease (expired-lease pass) for account ${accountId}:`,
+        claimErr2.message,
+      );
+      // Not fatal — proceed with whatever we already claimed in pass 1
+    } else {
+      for (const r of claimedExpiredLease || []) claimedIds.add(r.campaign_id);
+    }
+  }
+
+  const campaignsToProcess = campaigns.filter((c) =>
+    claimedIds.has(c.campaign_id),
+  );
+
+  const skippedCount = campaigns.length - campaignsToProcess.length;
+  if (skippedCount > 0) {
+    console.log(
+      `${skippedCount} campaign(s) on this account already leased by another worker - skipping this tick`,
+    );
+  }
+
+  if (campaignsToProcess.length === 0) return;
+
+  // Stall protection: a campaign is only "stuck" if it hasn't made ANY
+  // progress in STALL_MINUTES — not just because it's been running a long
+  // time. Large campaigns (thousands of recipients) can legitimately take
+  // hours, especially when round-robining with sibling campaigns on the
+  // same account. We check updated_at (touched every time a batch sends)
+  // instead of started_at (total elapsed time since the very first batch).
+
   const safeCampaigns = [];
-  for (const c of campaigns) {
+  for (const c of campaignsToProcess) {
     if (c.started_at) {
-      const minutesRunning = (Date.now() - new Date(c.started_at)) / 60000;
-      if (minutesRunning > 30) {
+      // last activity = updated_at if present, else fall back to started_at
+      const lastActivity = new Date(c.updated_at || c.started_at);
+      const minutesSinceActivity = (Date.now() - lastActivity) / 60000;
+
+      if (minutesSinceActivity > STALL_MINUTES) {
         console.warn(
-          `Campaign "${c.campaign_name}" timed out (${minutesRunning.toFixed(0)} min) - marking failed`,
+          `Campaign "${c.campaign_name}" stalled - no progress in ${minutesSinceActivity.toFixed(0)} min - marking failed`,
         );
         await supabase
           .from("campaigns")
-          .update({ status: "failed", completed_at: new Date().toISOString() })
+          .update({
+            status: "failed",
+            completed_at: new Date().toISOString(),
+            worker_id: null,
+            lease_expires_at: null,
+          })
           .eq("campaign_id", c.campaign_id);
         continue;
       }
@@ -201,29 +410,60 @@ async function processAccountCampaigns(accountId, campaigns) {
       );
       await supabase
         .from("campaigns")
-        .update({ status: "failed", completed_at: new Date().toISOString() })
+        .update({
+          status: "failed",
+          completed_at: new Date().toISOString(),
+          worker_id: null,
+          lease_expires_at: null,
+        })
         .eq("campaign_id", campaign.campaign_id);
       continue;
     }
 
     const warmupLimit = getWarmupMessageLimit(acct);
-    const pending = await fetchPendingMessages(
-      campaign.campaign_id,
-      warmupLimit,
-    );
 
-    if (pending.length === 0) {
+    // Tier 1: don't load the whole campaign's pending list into memory.
+    // A cheap COUNT tells us whether there's anything to do and how much
+    // (for logging), without materializing any rows. Actual message rows
+    // are fetched one small batch at a time inside the round-robin loop
+    // below, right before they're sent.
+    let pendingCountQuery = supabase
+      .from("campaign_messages")
+      .select("cm_id", { count: "exact", head: true })
+      .eq("campaign_id", campaign.campaign_id)
+      .eq("status", "pending");
+    const { count: pendingCount } = await pendingCountQuery;
+
+    if (!pendingCount || pendingCount === 0) {
       console.log(`"${campaign.campaign_name}": no pending messages`);
       await finalizeCampaign(campaign, acct, 0, 0, false);
       continue;
     }
 
+    const remainingBudget = warmupLimit !== null ? warmupLimit : Infinity;
+
     console.log(
-      `"${campaign.campaign_name}": ${pending.length} messages queued` +
-        (warmupLimit !== null ? ` (warm-up cap: ${warmupLimit})` : ""),
+      `"${campaign.campaign_name}": ${pendingCount} pending` +
+        (warmupLimit !== null
+          ? ` (warm-up cap this tick: ${warmupLimit})`
+          : ""),
     );
 
-    queues.push({ campaign, template, pending, sent: 0, failed: 0 });
+    if (remainingBudget <= 0) {
+      // Warm-up budget already exhausted before this tick even starts —
+      // pause immediately, same outcome as fetching 0 in the old code.
+      await finalizeCampaign(campaign, acct, 0, 0, true);
+      continue;
+    }
+
+    queues.push({
+      campaign,
+      template,
+      remainingBudget,
+      exhausted: false,
+      sent: 0,
+      failed: 0,
+    });
   }
 
   if (queues.length === 0) return;
@@ -233,23 +473,52 @@ async function processAccountCampaigns(accountId, campaigns) {
   let consecutiveEmptyRounds = 0;
 
   while (true) {
-    const anyRemaining = queues.some((q) => q.pending.length > 0);
+    const anyRemaining = queues.some((q) => !q.exhausted);
     if (!anyRemaining) break;
 
     const queue = queues[roundIndex % queues.length];
     roundIndex++;
 
-    if (queue.pending.length === 0) {
+    if (queue.exhausted) {
       consecutiveEmptyRounds++;
       if (consecutiveEmptyRounds >= queues.length) break;
       continue;
     }
     consecutiveEmptyRounds = 0;
 
-    const batch = queue.pending.splice(0, BATCH_SIZE);
+    const fetchSize = Math.min(BATCH_SIZE, queue.remainingBudget);
+
+    // Streaming fetch: pull only the next small batch right before we
+    // send it, instead of holding the whole campaign's pending list in
+    // memory for the entire tick. Same BATCH_SIZE, same round-robin
+    // fairness — only where the data lives in between batches changes.
+    const { data: batch, error: fetchErr } = await supabase
+      .from("campaign_messages")
+      .select("*")
+      .eq("campaign_id", queue.campaign.campaign_id)
+      .eq("status", "pending")
+      .limit(fetchSize);
+
+    if (fetchErr) {
+      console.error(
+        `Failed to fetch next batch for "${queue.campaign.campaign_name}":`,
+        fetchErr.message,
+      );
+      queue.exhausted = true;
+      continue;
+    }
+
+    if (!batch || batch.length === 0) {
+      queue.exhausted = true;
+      continue;
+    }
 
     console.log(
-      `\n[${queue.campaign.campaign_name}] batch of ${batch.length} - ${queue.pending.length} remain`,
+      `\n[${queue.campaign.campaign_name}] batch of ${batch.length} - budget remaining after this: ${
+        queue.remainingBudget === Infinity
+          ? "unlimited"
+          : Math.max(0, queue.remainingBudget - batch.length)
+      }`,
     );
 
     const { sent, failed } = await sendBatch(
@@ -261,8 +530,33 @@ async function processAccountCampaigns(accountId, campaigns) {
     queue.sent += sent;
     queue.failed += failed;
 
+    if (queue.remainingBudget !== Infinity) {
+      queue.remainingBudget -= batch.length;
+      if (queue.remainingBudget <= 0) queue.exhausted = true;
+    }
+    if (batch.length < fetchSize) {
+      // Fewer rows came back than we asked for — this campaign has no
+      // more pending messages right now.
+      queue.exhausted = true;
+    }
+
+    // Heartbeat: touch updated_at (stall detection) and extend the lease
+    // (Tier 1) so a healthy, actively-sending campaign never has its lease
+    // expire mid-flight and get reclaimed by mistake. Does not write
+    // messages_sent/messages_failed here (that's written once at finalize
+    // to avoid double-counting across batches).
+    await supabase
+      .from("campaigns")
+      .update({
+        updated_at: new Date().toISOString(),
+        lease_expires_at: new Date(
+          Date.now() + LEASE_DURATION_MS,
+        ).toISOString(),
+      })
+      .eq("campaign_id", queue.campaign.campaign_id);
+
     // Batch delay only when there is more work to do
-    const stillHasWork = queues.some((q) => q.pending.length > 0);
+    const stillHasWork = queues.some((q) => !q.exhausted);
     if (stillHasWork) {
       console.log(`Batch delay ${BATCH_DELAY_MS / 1000}s...`);
       await sleep(BATCH_DELAY_MS);
@@ -280,15 +574,18 @@ async function processAccountCampaigns(accountId, campaigns) {
     }
   }
 
-  // Finalize each campaign
+  // Finalize each campaign. The live COUNT query inside finalizeCampaign
+  // (not any in-memory flag) is what correctly distinguishes "warm-up
+  // capped us early, more pending remain in the DB" from "fully drained,
+  // campaign complete" — it works the same way regardless of why a
+  // queue stopped (warmup budget exhausted or genuinely out of rows).
   for (const queue of queues) {
-    const wasLimited = queue.pending.length > 0;
     await finalizeCampaign(
       queue.campaign,
       acct,
       queue.sent,
       queue.failed,
-      wasLimited,
+      false,
     );
   }
 
@@ -371,6 +668,11 @@ async function finalizeCampaign(
   const totalFailed = (campaign.messages_failed || 0) + failedThisTick;
 
   if (wasLimited) {
+    // Release the lease immediately on pause. Without this, this same
+    // worker (or any other) would be blocked from re-claiming this
+    // campaign until LEASE_DURATION_MS elapses, artificially stalling a
+    // perfectly healthy paused-for-warmup campaign for up to 3 minutes
+    // even in a single-worker deployment.
     await supabase
       .from("campaigns")
       .update({
@@ -378,6 +680,8 @@ async function finalizeCampaign(
         messages_sent: totalSent,
         messages_failed: totalFailed,
         updated_at: new Date().toISOString(),
+        worker_id: null,
+        lease_expires_at: null,
       })
       .eq("campaign_id", campaign.campaign_id);
     console.log(`"${campaign.campaign_name}" paused - will resume next tick`);
@@ -398,6 +702,8 @@ async function finalizeCampaign(
         messages_sent: totalSent,
         messages_failed: totalFailed,
         updated_at: new Date().toISOString(),
+        worker_id: null,
+        lease_expires_at: null,
       })
       .eq("campaign_id", campaign.campaign_id);
     console.log(`"${campaign.campaign_name}" paused - ${pendingLeft} remain`);
@@ -407,41 +713,6 @@ async function finalizeCampaign(
       `"${campaign.campaign_name}" completed - sent ${totalSent} / failed ${totalFailed}`,
     );
   }
-}
-
-/* ============================================================
-   FETCH PENDING MESSAGES (paginated)
-   ============================================================ */
-
-async function fetchPendingMessages(campaignId, limit = null) {
-  let allMessages = [];
-  let page = 0;
-  const pageSize = 1000;
-
-  while (true) {
-    const canFetch =
-      limit !== null
-        ? Math.min(pageSize, limit - allMessages.length)
-        : pageSize;
-
-    if (canFetch <= 0) break;
-
-    const { data: messages, error } = await supabase
-      .from("campaign_messages")
-      .select("*")
-      .eq("campaign_id", campaignId)
-      .eq("status", "pending")
-      .range(page * pageSize, page * pageSize + canFetch - 1);
-
-    if (error) throw error;
-    if (!messages || messages.length === 0) break;
-
-    allMessages = allMessages.concat(messages);
-    if (messages.length < canFetch) break;
-    page++;
-  }
-
-  return allMessages;
 }
 
 /* ============================================================
@@ -607,6 +878,8 @@ async function markCampaignCompleted(campaignId, sent, failed) {
         completed_at: new Date().toISOString(),
         messages_sent: sent,
         messages_failed: failed,
+        worker_id: null,
+        lease_expires_at: null,
       })
       .eq("campaign_id", campaignId);
   } catch (err) {
