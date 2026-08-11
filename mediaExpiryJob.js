@@ -3,7 +3,9 @@
 //
 // What it does:
 //   1. Finds all rows in whatsapp_media_uploads where uploaded_at is older than 25 days.
-//   2. For each expired media_id, sets media_id = NULL on the matching whatsapp_templates row.
+//   2. For each expired media_id, sets media_id = NULL on the matching whatsapp_templates row
+//      (single-header templates), and clears any matching entries inside carousel_media[]
+//      (media card carousel templates — each card holds its own media_id).
 //   3. Deletes the expired rows from whatsapp_media_uploads.
 //
 // Why 25 days: Meta expires uploaded media handles after 30 days.
@@ -116,6 +118,71 @@ export async function runMediaExpiryJob({ testAccountId = null } = {}) {
     }
   }
 
+  // ── Step 2b: Null out matching entries inside carousel_media[] ─────────────
+  // Carousel templates store one media_id per card in the carousel_media jsonb
+  // column, so a single expired upload only needs that one card's media_id
+  // cleared — card_index/header_format stay intact so the template list can
+  // still show "Needs reupload" against the right card.
+  if (expiredMediaIds.length > 0) {
+    const expiredSet = new Set(expiredMediaIds);
+
+    const { data: carouselTemplates, error: carouselFetchErr } = await supabase
+      .from("whatsapp_templates")
+      .select("wt_id, name, carousel_media")
+      .eq("is_carousel", true)
+      .not("carousel_media", "is", null);
+
+    if (carouselFetchErr) {
+      console.error(
+        "❌ Failed to fetch carousel templates:",
+        carouselFetchErr.message,
+      );
+    } else if (carouselTemplates && carouselTemplates.length > 0) {
+      let clearedCount = 0;
+
+      for (const tpl of carouselTemplates) {
+        const cards = Array.isArray(tpl.carousel_media)
+          ? tpl.carousel_media
+          : [];
+        const hasExpiredCard = cards.some((c) => expiredSet.has(c.media_id));
+        if (!hasExpiredCard) continue;
+
+        const updatedCards = cards.map((c) =>
+          expiredSet.has(c.media_id) ? { ...c, media_id: null } : c,
+        );
+
+        const { error: updateCarouselErr } = await supabase
+          .from("whatsapp_templates")
+          .update({ carousel_media: updatedCards })
+          .eq("wt_id", tpl.wt_id);
+
+        if (updateCarouselErr) {
+          console.error(
+            `❌ Failed to clear carousel media for ${tpl.name} (${tpl.wt_id}):`,
+            updateCarouselErr.message,
+          );
+        } else {
+          clearedCount++;
+          console.log(
+            `   • ${tpl.name} (${tpl.wt_id}) — cleared expired card media`,
+          );
+        }
+      }
+
+      if (clearedCount > 0) {
+        console.log(
+          `✅ Cleared expired card media on ${clearedCount} carousel template(s).`,
+        );
+      } else {
+        console.log(
+          "ℹ️  No carousel templates were referencing the expired media.",
+        );
+      }
+    } else {
+      console.log("ℹ️  No carousel templates with stored media found.");
+    }
+  }
+
   // ── Step 3: Delete expired rows from whatsapp_media_uploads ───────────────
   const expiredIds = expiredMedia.map((m) => m.wmu_id);
 
@@ -136,6 +203,6 @@ export async function runMediaExpiryJob({ testAccountId = null } = {}) {
     `✅ Deleted ${expiredIds.length} expired record(s) from whatsapp_media_uploads.`,
   );
   console.log(
-    "💡 Affected templates now show media_id = NULL. Users can re-upload from the Templates page.",
+    "💡 Affected templates (and carousel cards) now show media_id = NULL. Users can re-upload from the Templates page.",
   );
 }

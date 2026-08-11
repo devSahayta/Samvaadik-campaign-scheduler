@@ -178,36 +178,39 @@ async function sendWhatsAppMessage(account, template, msg) {
     },
   };
 
-  // Handle media/text header
-  const headerComponent = templateComponents?.find(
-    (c) => c.type === "HEADER",
-  );
+  // Handle media/text header (carousel templates have no top-level header —
+  // each card carries its own, built below instead)
+  if (!template.is_carousel) {
+    const headerComponent = templateComponents?.find(
+      (c) => c.type === "HEADER",
+    );
 
-  if (headerComponent?.format) {
-    const format = headerComponent.format.toUpperCase();
+    if (headerComponent?.format) {
+      const format = headerComponent.format.toUpperCase();
 
-    if (["IMAGE", "VIDEO", "DOCUMENT"].includes(format)) {
-      if (!msg.media_id) {
-        throw new Error(
-          `Template requires a ${format} media_id but none was provided`,
-        );
-      }
-      messageBody.template.components.push({
-        type: "header",
-        parameters: [
-          {
-            type: format.toLowerCase(),
-            [format.toLowerCase()]: { id: msg.media_id },
-          },
-        ],
-      });
-    } else if (format === "TEXT" && headerComponent.example) {
-      const headerText = headerComponent.example.header_text || [];
-      if (headerText.length > 0) {
+      if (["IMAGE", "VIDEO", "DOCUMENT"].includes(format)) {
+        if (!msg.media_id) {
+          throw new Error(
+            `Template requires a ${format} media_id but none was provided`,
+          );
+        }
         messageBody.template.components.push({
           type: "header",
-          parameters: headerText.map((text) => ({ type: "text", text })),
+          parameters: [
+            {
+              type: format.toLowerCase(),
+              [format.toLowerCase()]: { id: msg.media_id },
+            },
+          ],
         });
+      } else if (format === "TEXT" && headerComponent.example) {
+        const headerText = headerComponent.example.header_text || [];
+        if (headerText.length > 0) {
+          messageBody.template.components.push({
+            type: "header",
+            parameters: headerText.map((text) => ({ type: "text", text })),
+          });
+        }
       }
     }
   }
@@ -232,6 +235,16 @@ async function sendWhatsAppMessage(account, template, msg) {
     });
   }
 
+  // Media card carousel templates: each card carries its own header media
+  // (from template.carousel_media) and, for URL buttons with a dynamic
+  // suffix, its own button parameter (from msg.button_variables, falling
+  // back to template.button_variables / the button's own approved example).
+  if (template.is_carousel) {
+    messageBody.template.components.push(
+      buildCarouselComponent(template, templateComponents, msg),
+    );
+  }
+
   // Call WhatsApp Business API
   const response = await axios.post(
     `https://graph.facebook.com/v21.0/${account.phone_number_id}/messages`,
@@ -250,7 +263,12 @@ async function sendWhatsAppMessage(account, template, msg) {
     extractTemplateText(template),
     msg.template_variables,
   );
-  const templateButtons = extractTemplateButtons(template);
+  const templateButtons = template.is_carousel
+    ? null
+    : extractTemplateButtons(template);
+  const carouselCards = template.is_carousel
+    ? extractCarouselCardsForDisplay(template)
+    : null;
 
   // Store in whatsapp_messages
   const { data: wmRecord } = await supabase
@@ -273,7 +291,7 @@ async function sendWhatsAppMessage(account, template, msg) {
     msg.contact_name,
     msg.user_id,
     templateText,
-    msg.media_id,
+    template.is_carousel ? null : msg.media_id,
   );
 
   // Store in messages table
@@ -282,9 +300,10 @@ async function sendWhatsAppMessage(account, template, msg) {
       chat_id: chatId,
       sender_type: "admin",
       message: templateText,
-      message_type: "template",
-      media_path: msg.media_id || null,
+      message_type: template.is_carousel ? "template_carousel" : "template",
+      media_path: template.is_carousel ? null : msg.media_id || null,
       buttons: templateButtons,
+      carousel_cards: carouselCards,
       wm_id: wmRecord?.wm_id,
       created_at: new Date().toISOString(),
     });
@@ -418,4 +437,168 @@ function extractTemplateButtons(template) {
   } catch {
     return null;
   }
+}
+
+/* =====================================
+   HELPER: BUILD CAROUSEL COMPONENT (for media card carousel templates)
+====================================== */
+
+// Builds the `{ type: "carousel", cards: [...] }` component required by the
+// WhatsApp Cloud API when sending a media card carousel template. Each card's
+// header media comes from template.carousel_media (card_index -> media_id),
+// since scheduled_messages only carries a single top-level media_id which
+// doesn't apply to carousels. URL buttons with a dynamic suffix ({{1}}) get
+// their parameter value with this precedence:
+//   1. msg.button_variables      - the real per-send value (scheduled_messages)
+//   2. template.button_variables - the value captured at template-submission time
+//   3. the button's own approved `example`                    - last resort
+function buildCarouselComponent(template, templateComponents, msg) {
+  const carouselDef = templateComponents?.find((c) => c.type === "CAROUSEL");
+  if (!carouselDef || !Array.isArray(carouselDef.cards)) {
+    throw new Error("Carousel template is missing card definitions");
+  }
+
+  let carouselMedia = template.carousel_media;
+  if (typeof carouselMedia === "string") {
+    try {
+      carouselMedia = JSON.parse(carouselMedia);
+    } catch {
+      carouselMedia = [];
+    }
+  }
+  if (!Array.isArray(carouselMedia)) carouselMedia = [];
+
+  let templateButtonVariables = template.button_variables;
+  if (typeof templateButtonVariables === "string") {
+    try {
+      templateButtonVariables = JSON.parse(templateButtonVariables);
+    } catch {
+      templateButtonVariables = [];
+    }
+  }
+  if (!Array.isArray(templateButtonVariables)) templateButtonVariables = [];
+
+  let msgButtonVariables = msg?.button_variables;
+  if (typeof msgButtonVariables === "string") {
+    try {
+      msgButtonVariables = JSON.parse(msgButtonVariables);
+    } catch {
+      msgButtonVariables = [];
+    }
+  }
+  if (!Array.isArray(msgButtonVariables)) msgButtonVariables = [];
+
+  const cards = carouselDef.cards.map((card, cardIndex) => {
+    const headerComp = card.components?.find((c) => c.type === "HEADER");
+    const buttonsComp = card.components?.find((c) => c.type === "BUTTONS");
+    const format = (headerComp?.format || "IMAGE").toUpperCase();
+
+    const mediaEntry = carouselMedia.find((m) => m.card_index === cardIndex);
+    if (!mediaEntry?.media_id) {
+      throw new Error(
+        `Carousel card ${cardIndex + 1} is missing media - please re-upload it on the template`,
+      );
+    }
+
+    const cardComponents = [
+      {
+        type: "header",
+        parameters: [
+          {
+            type: format.toLowerCase(),
+            [format.toLowerCase()]: { id: mediaEntry.media_id },
+          },
+        ],
+      },
+    ];
+
+    (buttonsComp?.buttons || []).forEach((button, buttonIndex) => {
+      if (
+        button.type === "URL" &&
+        typeof button.url === "string" &&
+        button.url.includes("{{")
+      ) {
+        const perSendOverride = msgButtonVariables.find(
+          (v) => v.card_index === cardIndex && v.button_index === buttonIndex,
+        );
+        const templateOverride = templateButtonVariables.find(
+          (v) => v.card_index === cardIndex,
+        );
+        const value =
+          perSendOverride?.value ??
+          templateOverride?.example ??
+          button.example?.[0] ??
+          "";
+        cardComponents.push({
+          type: "button",
+          sub_type: "url",
+          index: buttonIndex,
+          parameters: [{ type: "text", text: String(value) }],
+        });
+      }
+    });
+
+    return { card_index: cardIndex, components: cardComponents };
+  });
+
+  return { type: "carousel", cards };
+}
+
+/* =====================================
+   HELPER: EXTRACT CAROUSEL CARDS FOR CHAT DISPLAY
+====================================== */
+
+// Builds a lightweight per-card summary (image URL, buttons) for storage in
+// messages.carousel_cards, so the chat UI can render the carousel without
+// re-resolving media ids. Prefers template.preview (already has Meta's
+// resolved public image URLs); falls back to raw carousel_media (media ids
+// only) if preview is unavailable.
+function extractCarouselCardsForDisplay(template) {
+  try {
+    let preview = template.preview;
+    if (typeof preview === "string") {
+      try {
+        preview = JSON.parse(preview);
+      } catch {
+        preview = null;
+      }
+    }
+    const previewCarousel = preview?.components?.find(
+      (c) => c.type === "CAROUSEL",
+    );
+    if (previewCarousel?.cards?.length) {
+      return previewCarousel.cards.map((card, idx) => {
+        const header = card.components?.find((c) => c.type === "HEADER");
+        const buttonsComp = card.components?.find((c) => c.type === "BUTTONS");
+        return {
+          card_index: idx,
+          image_url: header?.example?.header_handle?.[0] || null,
+          header_format: header?.format || null,
+          buttons: (buttonsComp?.buttons || []).map((b) => ({
+            text: b.text,
+            type: b.type,
+            url: b.url,
+          })),
+        };
+      });
+    }
+  } catch {
+    // fall through to carousel_media fallback below
+  }
+
+  let carouselMedia = template.carousel_media;
+  if (typeof carouselMedia === "string") {
+    try {
+      carouselMedia = JSON.parse(carouselMedia);
+    } catch {
+      carouselMedia = [];
+    }
+  }
+  if (!Array.isArray(carouselMedia) || carouselMedia.length === 0) return null;
+
+  return carouselMedia.map((m) => ({
+    card_index: m.card_index,
+    media_id: m.media_id,
+    header_format: m.header_format,
+  }));
 }
