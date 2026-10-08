@@ -7,6 +7,9 @@ import { createClient } from "@supabase/supabase-js";
 import axios from "axios";
 import FormData from "form-data";
 import { decode } from "html-entities";
+import https from "https";
+
+const noKeepAliveAgent = new https.Agent({ keepAlive: false }); // ← ADD THIS
 
 // Add near the top of cartRecoveryJob.js, after imports
 async function axiosWithRetry(
@@ -331,6 +334,7 @@ async function processConnection(connection, automation, account, template) {
           },
           auth: wcAuth,
           timeout: 15000,
+          httpsAgent: noKeepAliveAgent, // ← add this
         }),
       {
         retries: 2,
