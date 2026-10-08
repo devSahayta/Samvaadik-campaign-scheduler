@@ -327,9 +327,9 @@ async function processConnection(connection, automation, account, template) {
       () =>
         axios.get(`${WC_BASE}/orders`, {
           params: {
-            per_page: 50,
-            orderby: "modified",
-            order: "desc",
+            status: "checkout-draft",
+            per_page: 20,
+            // no orderby/order — avoid the expensive sort that's triggering the reset
           },
           auth: wcAuth,
           timeout: 15000,
@@ -341,9 +341,10 @@ async function processConnection(connection, automation, account, template) {
         label: `fetch draft orders (${connection.store_name})`,
       },
     );
-    draftOrders = (response.data || []).filter(
-      (o) => o.status === "checkout-draft",
-    );
+
+    draftOrders = (response.data || [])
+      .filter((o) => o.status === "checkout-draft") // keep as safety net
+      .sort((a, b) => new Date(b.date_modified) - new Date(a.date_modified));
   } catch (err) {
     console.warn(
       `   ⚠️  Could not fetch draft orders after retries: ${err.message}`,
