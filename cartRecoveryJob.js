@@ -8,6 +8,34 @@ import axios from "axios";
 import FormData from "form-data";
 import { decode } from "html-entities";
 
+// Add near the top of cartRecoveryJob.js, after imports
+async function axiosWithRetry(
+  fn,
+  { retries = 2, delayMs = 1000, label = "request" } = {},
+) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const isRetryable =
+        err.code === "ECONNRESET" ||
+        err.code === "ETIMEDOUT" ||
+        err.message?.includes("socket hang up") ||
+        err.message?.includes("timeout");
+
+      console.warn(
+        `   ⚠️  ${label} attempt ${attempt} failed: ${err.message}${isRetryable ? " (retryable)" : " (not retryable)"}`,
+      );
+
+      if (!isRetryable || attempt > retries) break;
+      await new Promise((r) => setTimeout(r, delayMs * attempt));
+    }
+  }
+  throw lastErr;
+}
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -292,19 +320,29 @@ async function processConnection(connection, automation, account, template) {
   // Fetch checkout-draft orders
   let draftOrders = [];
   try {
-    const response = await axios.get(`${WC_BASE}/orders`, {
-      params: {
-        status: "checkout-draft",
-        per_page: 50,
-        orderby: "modified",
-        order: "desc",
+    const response = await axiosWithRetry(
+      () =>
+        axios.get(`${WC_BASE}/orders`, {
+          params: {
+            status: "checkout-draft",
+            per_page: 50,
+            orderby: "modified",
+            order: "desc",
+          },
+          auth: wcAuth,
+          timeout: 15000,
+        }),
+      {
+        retries: 2,
+        delayMs: 1000,
+        label: `fetch draft orders (${connection.store_name})`,
       },
-      auth: wcAuth,
-      timeout: 15000,
-    });
+    );
     draftOrders = response.data || [];
   } catch (err) {
-    console.warn(`   ⚠️  Could not fetch draft orders: ${err.message}`);
+    console.warn(
+      `   ⚠️  Could not fetch draft orders after retries: ${err.message}`,
+    );
     return { checked: 0, sent: 0, skipped: 0 };
   }
 
