@@ -321,6 +321,7 @@ async function processConnection(connection, automation, account, template) {
   );
 
   // Fetch checkout-draft orders
+  // Fetch checkout-draft orders
   let draftOrders = [];
   try {
     const response = await axiosWithRetry(
@@ -329,7 +330,8 @@ async function processConnection(connection, automation, account, template) {
           params: {
             status: "checkout-draft",
             per_page: 20,
-            // no orderby/order — avoid the expensive sort that's triggering the reset
+            // no orderby/order — large sorted queries trigger a server-side
+            // ECONNRESET on this host; sort client-side instead below
           },
           auth: wcAuth,
           timeout: 15000,
@@ -341,9 +343,8 @@ async function processConnection(connection, automation, account, template) {
         label: `fetch draft orders (${connection.store_name})`,
       },
     );
-
     draftOrders = (response.data || [])
-      .filter((o) => o.status === "checkout-draft") // keep as safety net
+      .filter((o) => o.status === "checkout-draft") // safety net
       .sort((a, b) => new Date(b.date_modified) - new Date(a.date_modified));
   } catch (err) {
     console.warn(
