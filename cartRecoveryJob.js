@@ -327,14 +327,13 @@ async function processConnection(connection, automation, account, template) {
       () =>
         axios.get(`${WC_BASE}/orders`, {
           params: {
-            status: "checkout-draft",
             per_page: 50,
             orderby: "modified",
             order: "desc",
           },
           auth: wcAuth,
           timeout: 15000,
-          httpsAgent: noKeepAliveAgent, // ← add this
+          httpsAgent: noKeepAliveAgent,
         }),
       {
         retries: 2,
@@ -342,7 +341,9 @@ async function processConnection(connection, automation, account, template) {
         label: `fetch draft orders (${connection.store_name})`,
       },
     );
-    draftOrders = response.data || [];
+    draftOrders = (response.data || []).filter(
+      (o) => o.status === "checkout-draft",
+    );
   } catch (err) {
     console.warn(
       `   ⚠️  Could not fetch draft orders after retries: ${err.message}`,
