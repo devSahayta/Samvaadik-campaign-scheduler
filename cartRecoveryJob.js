@@ -312,13 +312,53 @@ async function storeCartRecoveryMessage({
 // multiple automations share the same connection — previously this fetch
 // ran once PER automation, doubling (or more) the request volume to the
 // store on every single tick.
-async function fetchDraftOrders(connection) {
-  const WC_BASE = `${connection.store_url}/wp-json/wc/v3`;
-  const wcAuth = {
-    username: connection.consumer_key,
-    password: connection.consumer_secret,
-  };
 
+// async function fetchDraftOrders(connection) {
+//   const WC_BASE = `${connection.store_url}/wp-json/wc/v3`;
+//   const wcAuth = {
+//     username: connection.consumer_key,
+//     password: connection.consumer_secret,
+//   };
+
+//   console.log(
+//     `\n   🛒 Checking store: ${connection.store_name || connection.store_url}`,
+//   );
+
+//   try {
+//     const response = await axiosWithRetry(
+//       () =>
+//         axios.get(`${WC_BASE}/orders`, {
+//           params: {
+//             status: "checkout-draft",
+//             per_page: 20,
+//             // no orderby/order — large sorted queries trigger a server-side
+//             // ECONNRESET on this host; sort client-side instead below
+//           },
+//           auth: wcAuth,
+//           timeout: 15000,
+//           httpsAgent: noKeepAliveAgent,
+//         }),
+//       {
+//         retries: 4,
+//         delayMs: 2000,
+//         label: `fetch draft orders (${connection.store_name})`,
+//       },
+//     );
+//     const draftOrders = (response.data || [])
+//       .filter((o) => o.status === "checkout-draft") // safety net
+//       .sort((a, b) => new Date(b.date_modified) - new Date(a.date_modified));
+
+//     console.log(`   📋 Found ${draftOrders.length} draft order(s)`);
+//     return draftOrders;
+//   } catch (err) {
+//     console.warn(
+//       `   ⚠️  Could not fetch draft orders after retries: ${err.message}`,
+//     );
+//     return [];
+//   }
+// }
+
+async function fetchDraftOrders(connection) {
   console.log(
     `\n   🛒 Checking store: ${connection.store_name || connection.store_url}`,
   );
@@ -326,26 +366,54 @@ async function fetchDraftOrders(connection) {
   try {
     const response = await axiosWithRetry(
       () =>
-        axios.get(`${WC_BASE}/orders`, {
-          params: {
-            status: "checkout-draft",
-            per_page: 20,
-            // no orderby/order — large sorted queries trigger a server-side
-            // ECONNRESET on this host; sort client-side instead below
+        axios.get(
+          `${connection.store_url}/wp-json/samvaadik/v1/abandoned-carts`,
+          {
+            params: { since_minutes: 1440 },
+            headers: { "x-api-key": "Samvaadik Abandoned Cart API-Key" },
+            timeout: 15000,
+            httpsAgent: noKeepAliveAgent,
           },
-          auth: wcAuth,
-          timeout: 15000,
-          httpsAgent: noKeepAliveAgent,
-        }),
+        ),
       {
         retries: 4,
         delayMs: 2000,
-        label: `fetch draft orders (${connection.store_name})`,
+        label: `fetch abandoned carts (${connection.store_name})`,
       },
     );
-    const draftOrders = (response.data || [])
-      .filter((o) => o.status === "checkout-draft") // safety net
-      .sort((a, b) => new Date(b.date_modified) - new Date(a.date_modified));
+
+    // Map plugin's response into the shape processConnection() expects,
+    // so the rest of the pipeline (phone check, 24h filter, pending/delay/
+    // send) works unchanged.
+    const draftOrders = (response.data || []).map((row) => ({
+      id: row.id,
+      status: "checkout-draft",
+      date_created: row.date_created,
+      date_modified: row.date_created,
+      billing: {
+        first_name: row.first_name,
+        last_name: row.last_name,
+        phone: row.phone,
+        address_1: row.billing_address_1,
+        city: row.city,
+        state: row.state,
+        postcode: row.postcode,
+      },
+      shipping: {
+        first_name: row.first_name,
+        last_name: row.last_name,
+        address_1: row.billing_address_1,
+        city: row.city,
+        state: row.state,
+        postcode: row.postcode,
+      },
+      line_items: row.line_items || [],
+      total: row.cart_total,
+      currency_symbol: "₹", // decode HTML entity, avoid relying on WP's &#8377;
+      payment_url: row.checkout_url,
+      customer_user_agent: "", // not available from this source — bot filter will just pass through
+      meta_data: [], // no AWB/tracking meta from this source; fine for cart recovery
+    }));
 
     console.log(`   📋 Found ${draftOrders.length} draft order(s)`);
     return draftOrders;
@@ -355,9 +423,7 @@ async function fetchDraftOrders(connection) {
     );
     return [];
   }
-}
-
-// ─── Main Recovery Logic ──────────────────────────────────────────────────────
+} // ─── Main Recovery Logic ──────────────────────────────────────────────────────
 
 async function processConnection(
   draftOrders,
