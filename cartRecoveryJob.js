@@ -307,9 +307,12 @@ async function storeCartRecoveryMessage({
   return data.message_id;
 }
 
-// ─── Main Recovery Logic ──────────────────────────────────────────────────────
-
-async function processConnection(connection, automation, account, template) {
+// ─── Fetch draft orders (ONCE per store) ───────────────────────────────────────
+// Pulled out of processConnection so it runs once per store even when
+// multiple automations share the same connection — previously this fetch
+// ran once PER automation, doubling (or more) the request volume to the
+// store on every single tick.
+async function fetchDraftOrders(connection) {
   const WC_BASE = `${connection.store_url}/wp-json/wc/v3`;
   const wcAuth = {
     username: connection.consumer_key,
@@ -320,9 +323,6 @@ async function processConnection(connection, automation, account, template) {
     `\n   🛒 Checking store: ${connection.store_name || connection.store_url}`,
   );
 
-  // Fetch checkout-draft orders
-  // Fetch checkout-draft orders
-  let draftOrders = [];
   try {
     const response = await axiosWithRetry(
       () =>
@@ -338,23 +338,34 @@ async function processConnection(connection, automation, account, template) {
           httpsAgent: noKeepAliveAgent,
         }),
       {
-        retries: 2,
-        delayMs: 1000,
+        retries: 4,
+        delayMs: 2000,
         label: `fetch draft orders (${connection.store_name})`,
       },
     );
-    draftOrders = (response.data || [])
+    const draftOrders = (response.data || [])
       .filter((o) => o.status === "checkout-draft") // safety net
       .sort((a, b) => new Date(b.date_modified) - new Date(a.date_modified));
+
+    console.log(`   📋 Found ${draftOrders.length} draft order(s)`);
+    return draftOrders;
   } catch (err) {
     console.warn(
       `   ⚠️  Could not fetch draft orders after retries: ${err.message}`,
     );
-    return { checked: 0, sent: 0, skipped: 0 };
+    return [];
   }
+}
 
-  console.log(`   📋 Found ${draftOrders.length} draft order(s)`);
+// ─── Main Recovery Logic ──────────────────────────────────────────────────────
 
+async function processConnection(
+  draftOrders,
+  connection,
+  automation,
+  account,
+  template,
+) {
   const delayMinutes = automation.delay_minutes || 60;
   const BOT_UA_PATTERN =
     /bot|crawler|spider|storebot|slurp|facebookexternalhit/i;
@@ -659,39 +670,58 @@ async function runCartRecoveryCron() {
 
     console.log(`✅ Found ${automations.length} cart recovery automation(s)`);
 
+    // Group automations by connection so we fetch each store's draft
+    // orders ONCE per tick, no matter how many automations share it.
+    const byConnection = new Map();
+    for (const automation of automations) {
+      const connId = automation.user_woocommerce_connections?.id;
+      if (!connId) continue;
+      if (!byConnection.has(connId)) byConnection.set(connId, []);
+      byConnection.get(connId).push(automation);
+    }
+
     let totalSent = 0,
       totalSkipped = 0,
       totalChecked = 0;
 
-    for (const automation of automations) {
-      const connection = automation.user_woocommerce_connections;
-      const template = automation.whatsapp_templates;
-      const account = automation.whatsapp_accounts;
+    for (const [connId, automationsForStore] of byConnection) {
+      const connection = automationsForStore[0].user_woocommerce_connections;
 
       if (!connection?.is_active) {
         console.log(`⚠️  Skipping inactive connection`);
         continue;
       }
 
-      if (!template || template.status !== "APPROVED") {
-        console.log(`⚠️  Skipping — template not approved: ${template?.name}`);
-        continue;
-      }
+      // Fetch draft orders ONCE for this store
+      const draftOrders = await fetchDraftOrders(connection);
 
-      if (!account) {
-        console.log(`⚠️  Skipping — no WhatsApp account found`);
-        continue;
-      }
+      for (const automation of automationsForStore) {
+        const template = automation.whatsapp_templates;
+        const account = automation.whatsapp_accounts;
 
-      const result = await processConnection(
-        connection,
-        automation,
-        account,
-        template,
-      );
-      totalChecked += result.checked;
-      totalSent += result.sent;
-      totalSkipped += result.skipped;
+        if (!template || template.status !== "APPROVED") {
+          console.log(
+            `⚠️  Skipping — template not approved: ${template?.name}`,
+          );
+          continue;
+        }
+
+        if (!account) {
+          console.log(`⚠️  Skipping — no WhatsApp account found`);
+          continue;
+        }
+
+        const result = await processConnection(
+          draftOrders,
+          connection,
+          automation,
+          account,
+          template,
+        );
+        totalChecked += result.checked;
+        totalSent += result.sent;
+        totalSkipped += result.skipped;
+      }
     }
 
     console.log("\n📊 Cart Recovery Summary:");
