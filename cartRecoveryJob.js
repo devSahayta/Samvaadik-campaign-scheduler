@@ -369,7 +369,7 @@ async function fetchDraftOrders(connection) {
         axios.get(
           `${connection.store_url}/wp-json/samvaadik/v1/abandoned-carts`,
           {
-            params: { since_minutes: 1440 },
+            params: { since_minutes: 1440, _cb: Date.now() },
             headers: { "x-api-key": "Samvaadik Abandoned Cart API-Key" },
             timeout: 15000,
             httpsAgent: noKeepAliveAgent,
