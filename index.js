@@ -17,6 +17,8 @@ import {
 
 import { startReconciliationCron } from "./orderReconciliationJob.js";
 
+import { startRetryReadyCron } from "./retryReadyNotificationJob.js";
+
 // Load environment variables
 dotenv.config();
 
@@ -65,6 +67,7 @@ try {
   startWhatsappStatusSyncCron();
   startWhatsappStatusEventsCleanupCron();
   startReconciliationCron();
+  startRetryReadyCron();
 
   console.log("✅ All schedulers running successfully!");
   console.log("🔄 Campaign check: every 60 seconds");
@@ -75,6 +78,8 @@ try {
   console.log(
     "🧹 WhatsApp status events cleanup: daily at 3:00 AM UTC (7-day retention)",
   );
+
+  console.log("📧 Retry-ready check: every 30 minutes");
   console.log("💡 Press Ctrl+C to stop (or let Render manage it)");
 
   console.log("════════════════════════════════════════════════════════\n");
