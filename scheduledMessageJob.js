@@ -235,6 +235,15 @@ async function sendWhatsAppMessage(account, template, msg) {
     });
   }
 
+  // Dynamic URL buttons ({{1}} in the url) on regular templates: the value
+  // comes from msg.button_variables ([{ button_index, value }]), validated
+  // by the backend when the message was scheduled.
+  if (!template.is_carousel) {
+    messageBody.template.components.push(
+      ...buildUrlButtonComponents(templateComponents, msg),
+    );
+  }
+
   // Media card carousel templates: each card carries its own header media
   // (from template.carousel_media) and, for URL buttons with a dynamic
   // suffix, its own button parameter (from msg.button_variables, falling
@@ -437,6 +446,57 @@ function extractTemplateButtons(template) {
   } catch {
     return null;
   }
+}
+
+/* =====================================
+   HELPER: BUILD URL BUTTON COMPONENTS (for regular templates)
+====================================== */
+
+function buildUrlButtonComponents(templateComponents, msg) {
+  const buttonsComp = templateComponents?.find(
+    (c) => (c.type || "").toUpperCase() === "BUTTONS",
+  );
+  if (!Array.isArray(buttonsComp?.buttons)) return [];
+
+  let msgButtonVariables = msg?.button_variables;
+  if (typeof msgButtonVariables === "string") {
+    try {
+      msgButtonVariables = JSON.parse(msgButtonVariables);
+    } catch {
+      msgButtonVariables = [];
+    }
+  }
+  if (!Array.isArray(msgButtonVariables)) msgButtonVariables = [];
+
+  const components = [];
+  buttonsComp.buttons.forEach((button, buttonIndex) => {
+    if (
+      (button.type || "").toUpperCase() !== "URL" ||
+      typeof button.url !== "string" ||
+      !/\{\{\d+\}\}/.test(button.url)
+    ) {
+      return;
+    }
+
+    const entry = msgButtonVariables.find(
+      (v) => v.card_index === undefined && v.button_index === buttonIndex,
+    );
+    const value = entry?.value;
+    if (value === undefined || value === null || String(value).trim() === "") {
+      throw new Error(
+        `Template URL button ${buttonIndex} ("${button.text}") needs a dynamic value but none was provided`,
+      );
+    }
+
+    components.push({
+      type: "button",
+      sub_type: "url",
+      index: String(buttonIndex),
+      parameters: [{ type: "text", text: String(value) }],
+    });
+  });
+
+  return components;
 }
 
 /* =====================================
