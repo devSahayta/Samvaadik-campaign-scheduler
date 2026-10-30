@@ -955,14 +955,22 @@ async function sendWhatsAppMessage(
               `Media ${format} template requires media_id but campaign has none selected`,
             );
           }
+
+          // ✅ Build media parameter — include filename for DOCUMENT so
+          //    WhatsApp shows the real file name instead of "Untitled"
+          const mediaParam = {
+            type: format.toLowerCase(),
+            [format.toLowerCase()]: {
+              id: campaignMediaId,
+              ...(format === "DOCUMENT" && {
+                filename: template.header_filename || "Document.pdf",
+              }),
+            },
+          };
+
           messageBody.template.components.push({
             type: "header",
-            parameters: [
-              {
-                type: format.toLowerCase(),
-                [format.toLowerCase()]: { id: campaignMediaId },
-              },
-            ],
+            parameters: [mediaParam],
           });
         } else if (format === "TEXT" && headerComponent.example) {
           const headerText = headerComponent.example.header_text || [];
