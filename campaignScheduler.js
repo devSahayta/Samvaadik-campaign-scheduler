@@ -420,6 +420,54 @@ async function processAccountCampaigns(accountId, campaigns) {
       continue;
     }
 
+    // ── Template approval gate ──────────────────────────────────────────
+    // A campaign can now be created while its template is still PENDING
+    // Meta's review (see agentTools.js createCampaign). Nothing below this
+    // point may run until the template is APPROVED — sendBatch/sendWhatsApp
+    // Message must never be reached for a non-approved template.
+    //
+    // PENDING: hold the campaign - undo the "processing" marker from the
+    // bulk update above (back to "scheduled") and release the lease, same
+    // as the warm-up-exhausted pause path below. The next tick (60s later)
+    // re-checks this same template row, which whatsappController.js's
+    // handleTemplateStatusUpdate webhook keeps current in near real time -
+    // so sending begins automatically within a tick or two of Meta's
+    // approval, with no polling of Meta itself needed here.
+    //
+    // Any other non-approved status (REJECTED, DISABLED, PAUSED, etc.) has
+    // nothing to wait for, so the campaign is failed outright, exactly like
+    // the "template not found" case above.
+    if (template.status !== "APPROVED") {
+      if (template.status === "PENDING") {
+        console.log(
+          `"${campaign.campaign_name}": template "${template.name}" still PENDING Meta approval - holding, will retry next tick`,
+        );
+        await supabase
+          .from("campaigns")
+          .update({
+            status: "scheduled",
+            updated_at: new Date().toISOString(),
+            worker_id: null,
+            lease_expires_at: null,
+          })
+          .eq("campaign_id", campaign.campaign_id);
+      } else {
+        console.error(
+          `"${campaign.campaign_name}": template "${template.name}" is ${template.status} (not approved) - marking failed`,
+        );
+        await supabase
+          .from("campaigns")
+          .update({
+            status: "failed",
+            completed_at: new Date().toISOString(),
+            worker_id: null,
+            lease_expires_at: null,
+          })
+          .eq("campaign_id", campaign.campaign_id);
+      }
+      continue;
+    }
+
     const warmupLimit = getWarmupMessageLimit(acct);
 
     // Tier 1: don't load the whole campaign's pending list into memory.
