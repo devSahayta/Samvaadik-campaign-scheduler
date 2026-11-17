@@ -534,6 +534,32 @@ async function processAccountCampaigns(accountId, campaigns) {
     }
     consecutiveEmptyRounds = 0;
 
+    // Cancellation check — a user can cancel a campaign at any time via
+    // POST /campaigns/:id/cancel, even while it's "processing" (see
+    // campaignController.cancelCampaign). That just flips a row in the DB;
+    // this in-memory round-robin loop has no way to see it on its own, so
+    // re-check this campaign's live status right before pulling its next
+    // batch. It's a single indexed-PK row read — negligible next to the
+    // Supabase writes already happening every batch — and it caps the gap
+    // between "user clicks cancel" and "sending actually stops" at one
+    // batch (≤ BATCH_SIZE messages + their per-message delays), since a
+    // batch already in flight is allowed to finish rather than being cut
+    // off mid-send.
+    const { data: liveCampaign, error: liveStatusErr } = await supabase
+      .from("campaigns")
+      .select("status")
+      .eq("campaign_id", queue.campaign.campaign_id)
+      .single();
+
+    if (!liveStatusErr && liveCampaign?.status === "cancelled") {
+      console.log(
+        `[${queue.campaign.campaign_name}] cancelled by user - stopping, will not send remaining pending messages`,
+      );
+      queue.exhausted = true;
+      queue.cancelled = true;
+      continue;
+    }
+
     const fetchSize = Math.min(BATCH_SIZE, queue.remainingBudget);
 
     // Streaming fetch: pull only the next small batch right before we
@@ -627,7 +653,18 @@ async function processAccountCampaigns(accountId, campaigns) {
   // capped us early, more pending remain in the DB" from "fully drained,
   // campaign complete" — it works the same way regardless of why a
   // queue stopped (warmup budget exhausted or genuinely out of rows).
+  //
+  // A queue the cancellation check above stopped is finalized separately:
+  // finalizeCampaign would otherwise flip status back to "scheduled" or
+  // "completed" (it never checks for "cancelled"), undoing the user's
+  // cancel. finalizeCancelledCampaign instead keeps status "cancelled",
+  // records whatever was sent this tick, and marks the still-pending
+  // contacts as cancelled so they're never picked up again.
   for (const queue of queues) {
+    if (queue.cancelled) {
+      await finalizeCancelledCampaign(queue.campaign, queue.sent, queue.failed);
+      continue;
+    }
     await finalizeCampaign(
       queue.campaign,
       acct,
@@ -761,6 +798,64 @@ async function finalizeCampaign(
       `"${campaign.campaign_name}" completed - sent ${totalSent} / failed ${totalFailed}`,
     );
   }
+}
+
+/* ============================================================
+   FINALIZE A CAMPAIGN CANCELLED MID-RUN
+   ============================================================ */
+
+// Called instead of finalizeCampaign for any queue the round-robin loop's
+// cancellation check stopped. Three things finalizeCampaign would get
+// wrong for a cancelled campaign:
+//   1. It writes status: "scheduled" or "completed" unconditionally -
+//      either one would silently undo the user's cancel.
+//   2. It never releases the pending campaign_messages rows - they'd sit
+//      as "pending" forever, which would make a future feature (or a
+//      stray retry) treat them as still-queued work.
+//   3. It would leave worker_id/lease_expires_at set, blocking this
+//      account from being reclaimed on this process (harmless here since
+//      we return right after, but kept symmetric with the other exit
+//      paths for safety if this function is ever called elsewhere).
+async function finalizeCancelledCampaign(
+  campaign,
+  sentThisTick,
+  failedThisTick,
+) {
+  const totalSent = (campaign.messages_sent || 0) + sentThisTick;
+  const totalFailed = (campaign.messages_failed || 0) + failedThisTick;
+
+  // Stop any remaining pending contacts from ever being sent - mark them
+  // explicitly as cancelled rather than leaving "pending" rows behind for
+  // a campaign that will never resume.
+  const { error: cmErr } = await supabase
+    .from("campaign_messages")
+    .update({ status: "cancelled", updated_at: new Date().toISOString() })
+    .eq("campaign_id", campaign.campaign_id)
+    .eq("status", "pending");
+
+  if (cmErr) {
+    console.error(
+      `Failed to mark pending messages cancelled for "${campaign.campaign_name}":`,
+      cmErr.message,
+    );
+  }
+
+  await supabase
+    .from("campaigns")
+    .update({
+      status: "cancelled",
+      completed_at: new Date().toISOString(),
+      messages_sent: totalSent,
+      messages_failed: totalFailed,
+      updated_at: new Date().toISOString(),
+      worker_id: null,
+      lease_expires_at: null,
+    })
+    .eq("campaign_id", campaign.campaign_id);
+
+  console.log(
+    `"${campaign.campaign_name}" cancelled - sent ${totalSent} / failed ${totalFailed} before stopping`,
+  );
 }
 
 /* ============================================================
