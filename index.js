@@ -76,7 +76,7 @@ try {
   startWhatsappStatusEventsCleanupCron();
   startReconciliationCron();
   startRetryReadyCron();
-  startSubscriptionRenewalCron(); // ← NEW
+  // startSubscriptionRenewalCron(); // ← NEW
 
   console.log("✅ All schedulers running successfully!");
   console.log("🔄 Campaign check: every 60 seconds");
