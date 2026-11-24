@@ -19,6 +19,8 @@ import { startReconciliationCron } from "./orderReconciliationJob.js";
 
 import { startRetryReadyCron } from "./retryReadyNotificationJob.js";
 
+import { startSubscriptionRenewalCron } from "./subscriptionRenewalJob.js"; // ← NEW
+
 // Load environment variables
 dotenv.config();
 
@@ -53,6 +55,12 @@ console.log(
   process.env.SUPABASE_SERVICE_ROLE_KEY?.substring(0, 20) + "...",
 );
 
+if (!process.env.BACKEND_URL || !process.env.CRON_SECRET) {
+  console.warn(
+    "⚠️  BACKEND_URL or CRON_SECRET not set — subscription auto-renewal checks will be skipped (every 15 min) until both are added in Render → Environment",
+  );
+}
+
 // Start all cron jobs
 console.log("\n⏰ Starting cron jobs...");
 try {
@@ -68,6 +76,7 @@ try {
   startWhatsappStatusEventsCleanupCron();
   startReconciliationCron();
   startRetryReadyCron();
+  startSubscriptionRenewalCron(); // ← NEW
 
   console.log("✅ All schedulers running successfully!");
   console.log("🔄 Campaign check: every 60 seconds");
@@ -80,6 +89,7 @@ try {
   );
 
   console.log("📧 Retry-ready check: every 30 minutes");
+  console.log("💳 Subscription auto-renewal check: every 15 minutes"); // ← NEW
   console.log("💡 Press Ctrl+C to stop (or let Render manage it)");
 
   console.log("════════════════════════════════════════════════════════\n");
